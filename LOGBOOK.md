@@ -1012,3 +1012,107 @@ impossible to evaluate whether code changes helped or hurt.
 1. Validate full pipeline against Python vhs-decode reference (PSNR comparison)
 2. Parameterize K1 filters for PAL/LP/EP (Phase 3)
 3. Optimization: CUDA streams, kernel fusion, PCIe overlap (Phase 6)
+
+---
+
+## K4 Hsync Refinement: Right-Edge Detection (2026-03-24)
+
+### Problem
+
+The v0 K4 implementation (left-edge only) produced visible horizontal line displacement
+artifacts — individual scanlines shifted left/right by a few pixels, creating jagged
+vertical edges. This was most visible on the black/white stripe pattern and on the left
+edge of frame where chroma misalignment shifted into the visible area.
+
+Multiple downstream-fix approaches were attempted and rejected:
+- Median spacing smoothing (v4): degraded more lines than it fixed
+- Isolated-outlier correction (v5): philosophy rejected — should fix detection, not patch symptoms
+- Front porch fallback measurement: only changed 4 rows (0.7% of pixels), no visible improvement
+
+User's guiding principle: **"I should focus on improving the detection quality rather
+than attempting fixes downstream."**
+
+### Root Cause Analysis
+
+The v0 algorithm detected only the **leading (falling) edge** of the hsync pulse — where
+the signal drops from blanking level into the sync tip. This edge is susceptible to
+FM demodulation overshoot: the sharp transition from blanking to sync tip creates ringing
+artifacts in the demodulated signal that shift the apparent zero-crossing position.
+
+The Python vhs-decode reference (`refine_linelocs_hsync()` in `sync.pyx`) detects **both**
+edges and prefers the **trailing (rising) edge** as the primary result. The code comment
+explains why: *"less likely to be messed up by overshoot."*
+
+### Solution: Right-Edge (Trailing Edge) Detection
+
+Added rising-edge zero-crossing detection to K4, matching the Python reference algorithm.
+The kernel now performs both left-edge and right-edge detection, preferring the right-edge
+result when it passes validation.
+
+**New device function: `find_rising_crossing()`**
+- Finds first sample where signal rises above target (opposite of `find_falling_crossing`)
+- Requires start sample to be below target (matches Python `calczc_do(..., edge=1)`)
+- Linear interpolation for sub-sample accuracy
+
+**Right-edge algorithm in `k_hsync_refine`:**
+
+1. Search for rising edge near expected end of hsync pulse:
+   - Start: `lineloc + hsync_width - 1µs` (1µs before expected trailing edge)
+   - Count: `hsync_width × 2` samples
+   - Target: `pulse_threshold_hz` (same −20 IRE threshold)
+
+2. From the right crossing, derive the estimated leading edge:
+   - `zc_fr = right_cross - hsync_width`
+
+3. Measure sync and porch levels from the derived position:
+   - Sync level: median of signal 1.0–2.5 µs after `zc_fr`
+   - Porch level: median of signal `hsync_width + 1.0` to `hsync_width + 2.0` µs after `zc_fr`
+   (Note: porch measurement differs from left-edge — measured from derived leading edge
+   plus hsync width, matching Python `zc_fr + normal_hsync_length + 1µs`)
+
+4. Refine at midpoint threshold (rising edge):
+   - Find rising crossing at `(sync_level + porch_level) / 2`
+   - Validate: refined must be within ±0.5 µs of initial right crossing
+
+5. Compute final lineloc:
+   - `right_cross - hsync_width + right_edge_offset`
+   - Where `right_edge_offset = 2.25 × (sample_rate_mhz / 40.0)`
+   - This is a calibration constant from Python (comment: "Magic value here, this seems
+     to give approximately correct results")
+
+6. Validation: right-edge result must be within ±2 µs of left-edge result (or original
+   if left-edge failed)
+
+**Result selection (matches Python):**
+- If right-edge passes validation → use right-edge result (PRIMARY)
+- Else if left-edge passes validation → use left-edge result (FALLBACK)
+- Else → keep original lineloc from K3
+
+### New kernel parameters
+
+Two new parameters passed from host:
+- `hsync_width_samples`: `fmt.hsync_width` (4.7 µs × sample_rate, already in VideoFormat)
+- `right_edge_offset`: `2.25 × (sample_rate_mhz / 40.0)` (computed in host launcher)
+
+### Results
+
+Frame 5 comparison (10-second NTSC test clip):
+- **v0 (left-edge only):** Visible horizontal line displacement on vertical edges
+- **Right-edge:** Line displacement artifacts completely resolved in test frame
+
+The right-edge result changes 95% of pixels compared to v0 — this is expected because
+nearly every line gets a different (better) crossing point, which shifts the resampled
+TBC output values across the entire image.
+
+### What Changed (files)
+
+- `src/pipeline/hsync_refine.cu`:
+  - Renamed `find_zero_crossing()` → `find_falling_crossing()` (clarity)
+  - Added `find_rising_crossing()` device function
+  - `k_hsync_refine`: added right-edge detection with left-edge fallback
+  - Host launcher: passes `hsync_width` and `right_edge_offset`
+
+### Pending
+
+- 5-minute clip sanity check (broader test across varied content)
+- Chroma quality improvements (burst deemphasis, comb filter, track auto-detection)

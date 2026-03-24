@@ -16,13 +16,9 @@
 // Matches Python refine_linelocs_hsync() from vhsdecode/sync.pyx.
 // ============================================================================
 
-// Find zero crossing: first sample where signal crosses target level
-// (looking for falling edge: signal goes from above to below target,
-//  which is the leading edge of the hsync pulse in Hz domain)
-//
-// Returns fractional sample position via linear interpolation,
-// or -1.0 if no crossing found.
-__device__ double find_zero_crossing(
+// Find falling-edge zero crossing: first sample where signal drops below target.
+// Returns fractional sample position via linear interpolation, or -1.0 if not found.
+__device__ double find_falling_crossing(
     const double* sig,
     int start, int count,
     double target,
@@ -34,12 +30,38 @@ __device__ double find_zero_crossing(
         double prev = sig[i - 1];
         double curr = sig[i];
 
-        // Falling edge: prev >= target, curr < target
         if (prev >= target && curr < target) {
-            // Linear interpolation for sub-sample accuracy
             double a = prev - target;
             double b = curr - target;
             double frac = (a - b != 0.0) ? (a / (a - b)) : 0.0;
+            return (double)(i - 1) + frac;
+        }
+    }
+    return -1.0;
+}
+
+// Find rising-edge zero crossing: first sample where signal rises above target.
+// Returns fractional sample position via linear interpolation, or -1.0 if not found.
+// Matches Python calczc_do(..., edge=1): requires start sample to be below target.
+__device__ double find_rising_crossing(
+    const double* sig,
+    int start, int count,
+    double target,
+    int total_samples)
+{
+    if (start < 0 || start + count > total_samples || count < 2) return -1.0;
+
+    // Python: if data[start] > target, return NONE (already past threshold)
+    if (sig[start] > target) return -1.0;
+
+    for (int i = start + 1; i < start + count; i++) {
+        double prev = sig[i - 1];
+        double curr = sig[i];
+
+        if (prev < target && curr >= target) {
+            double a = target - prev;
+            double b = target - curr;
+            double frac = (a + b != 0.0) ? (a / (a - b)) : 0.0;
             return (double)(i - 1) + frac;
         }
     }
@@ -82,7 +104,9 @@ __global__ void k_hsync_refine(
     int total_demod_samples,
     double pulse_threshold_hz,   // initial crossing threshold (-20 IRE in Hz)
     double one_usec_samples,     // 1 µs in samples
-    int active_line_start)       // skip vblank lines
+    int active_line_start,       // skip vblank lines
+    double hsync_width_samples,  // ~4.7 µs in samples
+    double right_edge_offset)    // 2.25 * (sample_rate_mhz / 40.0)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total_lines = num_fields * lines_per_frame;
@@ -91,8 +115,6 @@ __global__ void k_hsync_refine(
     int field = idx / lines_per_frame;
     int line = idx % lines_per_frame;
 
-    // Skip vblank lines (VSYNC area has no regular hsync)
-    // Lines 0-9 are vblank for NTSC, 0-7 for PAL
     if (line < active_line_start) return;
 
     double* loc = &linelocs[field * lines_per_frame + line];
@@ -100,62 +122,120 @@ __global__ void k_hsync_refine(
     int one_usec = (int)(one_usec_samples + 0.5);
 
     // ---------------------------------------------------------------
-    // Pass 1: Find initial zero crossing at pulse_threshold_hz
-    // Search window: 1 µs before to 1 µs after the estimated lineloc
+    // Left-edge detection (falling edge = leading edge of hsync pulse)
     // ---------------------------------------------------------------
     int search_start = (int)(original - one_usec);
     int search_count = one_usec * 2;
 
-    double zc = find_zero_crossing(demod_05, search_start, search_count,
-                                   pulse_threshold_hz, total_demod_samples);
+    double zc = find_falling_crossing(demod_05, search_start, search_count,
+                                      pulse_threshold_hz, total_demod_samples);
 
-    if (zc < 0.0) return;  // no crossing found, keep original
+    double left_result = -1.0;
+
+    if (zc >= 0.0) {
+        int zc_int = (int)(zc + 0.5);
+
+        // Sync level: 1.0 to 2.5 µs after crossing
+        int sync_start = zc_int + (int)(1.0 * one_usec_samples);
+        int sync_count = (int)(1.5 * one_usec_samples);
+        double sync_level = window_median(demod_05, sync_start, sync_count,
+                                          total_demod_samples);
+
+        // Porch level: 8 to 9 µs after crossing
+        int porch_start = zc_int + (int)(8.0 * one_usec_samples);
+        int porch_count = (int)(1.0 * one_usec_samples);
+        double porch_level = window_median(demod_05, porch_start, porch_count,
+                                           total_demod_samples);
+
+        if (porch_level > sync_level) {
+            double midpoint = (sync_level + porch_level) / 2.0;
+
+            int refine_start = (int)(original - one_usec * 2);
+            int refine_count = (int)(one_usec_samples * 4);
+
+            double zc2 = find_falling_crossing(demod_05, refine_start, refine_count,
+                                               midpoint, total_demod_samples);
+
+            if (zc2 >= 0.0 && fabs(zc2 - zc) <= one_usec_samples * 0.5) {
+                left_result = zc2;
+            }
+        }
+    }
 
     // ---------------------------------------------------------------
-    // Pass 2: Measure sync and porch levels, refine at midpoint
+    // Right-edge detection (rising edge = trailing edge of hsync pulse)
+    // Python: "less likely to be messed up by overshoot"
     //
-    // sync_level: median of signal 1.0-2.5 µs after crossing
-    //            (in the middle of the sync pulse)
-    // porch_level: median of signal 8-9 µs after crossing
-    //            (the back porch / blanking level)
+    // Search for the rising edge near the expected end of hsync pulse.
+    // From the right cross, derive the line start position:
+    //   lineloc = right_cross - hsync_width + offset
     // ---------------------------------------------------------------
-    int zc_int = (int)(zc + 0.5);
+    double right_result = -1.0;
 
-    // Sync level: 1.0 to 2.5 µs after crossing
-    int sync_start = zc_int + (int)(1.0 * one_usec_samples);
-    int sync_count = (int)(1.5 * one_usec_samples);
-    double sync_level = window_median(demod_05, sync_start, sync_count,
-                                       total_demod_samples);
+    // Search window: start at (original + hsync_width - 1µs)
+    // Python: ll1 + normal_hsync_length - one_usec, count = normal_hsync_length * 2
+    int right_search_start = (int)(original + hsync_width_samples - one_usec_samples);
+    int right_search_count = (int)(hsync_width_samples * 2);
 
-    // Porch level: 8 to 9 µs after crossing
-    int porch_start = zc_int + (int)(8.0 * one_usec_samples);
-    int porch_count = (int)(1.0 * one_usec_samples);
-    double porch_level = window_median(demod_05, porch_start, porch_count,
-                                        total_demod_samples);
+    double right_cross = find_rising_crossing(demod_05, right_search_start,
+                                              right_search_count,
+                                              pulse_threshold_hz,
+                                              total_demod_samples);
 
-    // Sanity check: porch should be above sync (higher Hz = higher IRE)
-    if (porch_level <= sync_level) return;
+    if (right_cross >= 0.0) {
+        // Derive estimated leading edge from right cross
+        double zc_fr = right_cross - hsync_width_samples;
+        int zc_fr_int = (int)(zc_fr + 0.5);
 
-    // Midpoint threshold
-    double midpoint = (sync_level + porch_level) / 2.0;
+        // Sync level: 1.0 to 2.5 µs after the derived leading edge
+        // Python: demod_05[zc_fr + 1µs : zc_fr + 2.5µs]
+        int r_sync_start = zc_fr_int + (int)(1.0 * one_usec_samples);
+        int r_sync_count = (int)(1.5 * one_usec_samples);
+        double r_sync_level = window_median(demod_05, r_sync_start, r_sync_count,
+                                            total_demod_samples);
+
+        // Porch level: hsync_width + 1µs to hsync_width + 2µs after derived leading edge
+        // Python: demod_05[zc_fr + normal_hsync_length + 1µs : zc_fr + normal_hsync_length + 2µs]
+        int r_porch_start = zc_fr_int + (int)(hsync_width_samples + 1.0 * one_usec_samples);
+        int r_porch_count = (int)(1.0 * one_usec_samples);
+        double r_porch_level = window_median(demod_05, r_porch_start, r_porch_count,
+                                             total_demod_samples);
+
+        if (r_porch_level > r_sync_level) {
+            double r_midpoint = (r_sync_level + r_porch_level) / 2.0;
+
+            // Refine: find rising edge at midpoint threshold
+            // Python: calczc_do(demod_05, ll1 + normal_hsync_length - one_usec, midpoint, count=400)
+            int r_refine_start = (int)(original + hsync_width_samples - one_usec_samples);
+            int r_refine_count = (int)(hsync_width_samples * 2);
+
+            double zc2_r = find_rising_crossing(demod_05, r_refine_start,
+                                                r_refine_count, r_midpoint,
+                                                total_demod_samples);
+
+            if (zc2_r >= 0.0 && fabs(zc2_r - right_cross) <= one_usec_samples * 0.5) {
+                // Derive lineloc from right edge
+                // Python: right_cross - normal_hsync_length + (2.25 * (sample_rate_mhz / 40.0))
+                double candidate = right_cross - hsync_width_samples + right_edge_offset;
+
+                // Sanity: should be within ±2µs of left-edge result (or original if no left)
+                double reference = (left_result >= 0.0) ? left_result : original;
+                if (fabs(candidate - reference) <= one_usec_samples * 2.0) {
+                    right_result = candidate;
+                }
+            }
+        }
+    }
 
     // ---------------------------------------------------------------
-    // Pass 2 crossing: find refined zero crossing at midpoint level
-    // Search in a wider window around the original estimate
+    // Result selection: prefer right-edge (Python behavior)
     // ---------------------------------------------------------------
-    int refine_start = (int)(original - one_usec * 2);
-    int refine_count = (int)(one_usec_samples * 4);
-
-    double zc2 = find_zero_crossing(demod_05, refine_start, refine_count,
-                                    midpoint, total_demod_samples);
-
-    if (zc2 < 0.0) return;
-
-    // Sanity check: refined position should be within ±0.5 µs of initial
-    if (fabs(zc2 - zc) > one_usec_samples * 0.5) return;
-
-    // Accept the refined position
-    *loc = zc2;
+    if (right_result >= 0.0) {
+        *loc = right_result;
+    } else if (left_result >= 0.0) {
+        *loc = left_result;
+    }
+    // else: keep original
 }
 
 
@@ -174,8 +254,9 @@ void hsync_refine(const double* d_demod_05,
     int blocks = (total_lines + threads - 1) / threads;
 
     double one_usec_samples = 1.0e-6 * fmt.sample_rate;
+    double sample_rate_mhz = fmt.sample_rate / 1.0e6;
+    double right_edge_offset = 2.25 * (sample_rate_mhz / 40.0);
 
-    // Pass 1: Hsync zero-crossing refinement
     k_hsync_refine<<<blocks, threads>>>(
         d_demod_05,
         d_linelocs,
@@ -184,6 +265,7 @@ void hsync_refine(const double* d_demod_05,
         total_demod_samples,
         fmt.pulse_threshold_hz,
         one_usec_samples,
-        fmt.active_line_start);
-
+        fmt.active_line_start,
+        fmt.hsync_width,
+        right_edge_offset);
 }
