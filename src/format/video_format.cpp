@@ -33,8 +33,18 @@ VideoFormat::VideoFormat(VideoSystem sys, double sample_rate_mhz)
         chroma_under     = 629000.0;
         luma_carrier     = 3900000.0;   // ~3.4-4.4 MHz typical VHS NTSC
         burst_abs_ref    = 4416.0;
+        burst_start_us   = 5.3;
+        burst_end_us     = 7.8;
         output_line_len  = 910;
         output_field_lines = 263;
+        num_eq_pulses    = 6;
+        field_lines_first  = 263;
+        field_lines_second = 262;
+
+        // VHS NTSC IRE mapping (from vhsdecode format_defs/vhs.py)
+        hz_ire    = 1e6 / 140.0;                    // ~7142.857 Hz/IRE
+        ire0      = 4.4e6 - (hz_ire * 100.0);       // ~3,685,714 Hz at 0 IRE
+        vsync_ire = -40.0;                           // sync tip at -40 IRE
     } else {
         lines_per_frame  = 625;
         lines_per_field  = 313;    // alternates 312/313
@@ -44,9 +54,36 @@ VideoFormat::VideoFormat(VideoSystem sys, double sample_rate_mhz)
         fsc              = 4433618.75;
         chroma_under     = 626000.0;
         luma_carrier     = 3800000.0;   // ~3.4-4.4 MHz typical VHS PAL
-        burst_abs_ref    = 4416.0;      // TODO: confirm PAL value
+        burst_abs_ref    = 5000.0;
+        burst_start_us   = 5.6;
+        burst_end_us     = 7.85;
         output_line_len  = 1135;
         output_field_lines = 313;
+        num_eq_pulses    = 5;
+        field_lines_first  = 312;
+        field_lines_second = 313;
+
+        // VHS PAL IRE mapping (from vhsdecode format_defs/vhs.py)
+        vsync_ire = -0.3 * (100.0 / 0.7);           // ~-42.857 IRE
+        hz_ire    = 1e6 / (100.0 + (-vsync_ire));    // ~7000 Hz/IRE
+        ire0      = 4.8e6 - (hz_ire * 100.0);        // ~4,100,000 Hz at 0 IRE
+    }
+
+    // Derived sync levels
+    sync_tip_hz        = ire0 + hz_ire * vsync_ire;
+    pulse_threshold_hz = ire0 + hz_ire * (-20.0);    // -20 IRE: halfway between sync and blanking
+
+    // TBC output scaling (ld-tools compatible uint16 range)
+    // Formula: output = clip((ire_shifted * output_scale) + output_zero, 0, 65535)
+    // where ire_shifted = (hz - ire0) / hz_ire - vsync_ire
+    if (sys == VideoSystem::NTSC) {
+        output_zero  = 1024.0;                          // 0x0400
+        output_scale = (51200.0 - 1024.0) / (100.0 - vsync_ire);  // (0xC800 - 0x0400) / IRE range
+        active_line_start = 10;
+    } else {
+        output_zero  = 256.0;                           // 0x0100
+        output_scale = (54016.0 - 256.0) / (100.0 - vsync_ire);   // (0xD300 - 0x0100) / IRE range
+        active_line_start = 8;  // PAL has fewer EQ pulses
     }
 
     output_rate = 4.0 * fsc;
@@ -74,4 +111,6 @@ void VideoFormat::print_info() const {
     fprintf(stderr, "  Output: %d samples/line @ %.6f MHz (4*fsc)\n",
             output_line_len, output_rate / 1e6);
     fprintf(stderr, "  Chroma-under: %.0f Hz  Fsc: %.0f Hz\n", chroma_under, fsc);
+    fprintf(stderr, "  IRE: 0=%.0f Hz  sync_tip=%.0f Hz  threshold=%.0f Hz  (%.1f Hz/IRE)\n",
+            ire0, sync_tip_hz, pulse_threshold_hz, hz_ire);
 }

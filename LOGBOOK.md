@@ -294,11 +294,721 @@ The intended real-time capture usage:
 capture_device -r 28e6 | cuvhs -f 28 --system NTSC --format u8 - output
 ```
 
+---
+
+## Kernel 1: FM Demodulation (2026-03-23)
+
+### Overview
+
+Implemented the full FM demodulation pipeline (K1) — the foundation kernel that
+everything downstream depends on. This is the most complex single kernel in the
+pipeline: RF bandpass filtering, Hilbert transform, phase unwrap (FM discrimination),
+deemphasis, and dual-path post-demod filtering.
+
+### Pipeline (all GPU, zero CPU-GPU transfers per batch)
+
+```
+Raw samples (fft_size-padded)
+  |
+  +--> R2C FFT (cuFFT batched D2Z)
+  +--> RF bandpass × Hilbert weight (element-wise, freq domain)
+  +--> Expand half → full spectrum (negative freqs = 0)
+  +--> C2C inverse FFT → complex analytic signal
+  +--> Phase extraction (parallel atan2)
+  +--> Sequential unwrap → instantaneous frequency (Hz)
+  |
+  +--> R2C FFT of demod signal
+  +--> Apply FVideo filter → C2R IFFT → video output (d_demod)
+  +--> Apply FVideo05 filter → C2R IFFT → sync output (d_demod_05)
+```
+
+### Filter Parameters (VHS NTSC SP)
+
+All filter coefficients are computed once on CPU at init and uploaded to GPU VRAM.
+Per-batch processing is 100% GPU.
+
+**RF bandpass (pre-demod):**
+- Butterworth bandpass: 500 kHz – 6.5 MHz, order 8
+- Extra lowpass: 6.0 MHz, order 25
+- Extra highpass: 1.2 MHz, order 20
+- Combined as magnitude product: `|BPF| × |LPF| × |HPF|`
+- Multiplied by Hilbert weights: DC=1, positive freqs=2, Nyquist=1
+
+**FM deemphasis (IEC 774-1):**
+- High-shelf filter inverted to create deemphasis
+- Midpoint: 273,755.82 Hz, Gain: 13.9794 dB, Q: 0.462088186
+- Derived from RC time constant 1.3 µs with 4:1 resistor divider
+
+**Post-demod video (FVideo = deemph × LPF):**
+- Supergaussian LPF: 6.6 MHz, order 9
+- Complex-valued (deemphasis has phase response)
+- Pre-scaled by 1/N for cuFFT normalization
+
+**Post-demod sync (FVideo05 = deemph × LPF × FIR):**
+- Same as FVideo plus 65-tap FIR at 0.5 MHz (Hamming window)
+- Group delay (32 samples) compensated in frequency domain via `e^{jωd}`
+
+### FFT Size and cuFFT Plans
+
+`samples_per_field = 468140 = 2² × 5 × 23407` — the prime factor 23407 makes this
+a terrible FFT size. cuFFT's Bluestein fallback requires massive workspace, causing
+`CUFFT_ALLOC_FAILED` with batch=512.
+
+**Fix:** Pad to nearest 7-smooth number: `468750 = 2 × 3 × 5⁷` (+610 samples, 0.13%).
+cuFFT handles this efficiently with mixed-radix.
+
+Three batched cuFFT plans created at init (all double-precision):
+- **D2Z** (R2C): 468750 real → 234376 complex, batch up to 512
+- **Z2Z** (C2C inverse): 468750 complex → 468750 complex, batch up to 512
+- **Z2D** (C2R): 234376 complex → 468750 real, batch up to 512
+
+### Memory Layout and Buffer Reuse
+
+`d_analytic` (max_batch × fft_size × 16 bytes) serves multiple roles:
+1. **Padded input** (as `double*`): raw samples zero-padded to fft_size
+2. **Full spectrum** (as `cufftDoubleComplex*`): for C2C inverse
+3. **Phase angles** (as `double*`): atan2 output, aliased over complex data
+4. **C2R output** (as `double*`): fft_size-strided IFFT output before trimming
+
+This reuse avoids allocating additional scratch buffers.
+
+**Per-field VRAM budget:**
+- Pipeline buffers: ~11.6 MB (raw + demod + demod_05 + pulses + linelocs + TBC)
+- K1 scratch: ~14.3 MB (fft_half + analytic + post_fft)
+- Total: ~25.9 MB per field → 512 fields in ~13.3 GB
+
+### Phase Unwrap Strategy
+
+The FM discrimination step (complex analytic → instantaneous frequency) has a
+sequential dependency: `np.unwrap` requires cumulative correction tracking.
+
+Split into two kernels:
+1. **k_compute_angles** — fully parallel atan2 on all samples across all fields
+2. **k_unwrap_to_hz** — one thread per field, sequential scan over ~468k samples
+
+The parallel atan2 dominates the cost. The sequential unwrap is ~20ms for 512 fields
+(simple integer comparisons and additions, no transcendentals). Future optimization:
+parallel prefix sum with CUB BlockScan.
+
+### Butterworth Magnitude via Bilinear Transform
+
+Instead of porting scipy's `butter()` + `freqz()`, the filter magnitudes are computed
+directly from the bilinear-transform formula:
+
+- **LPF:** `|H(ω)| = 1/√(1 + (tan(ω/2)/tan(ωc/2))^(2N))`
+- **HPF:** `|H(ω)| = 1/√(1 + (tan(ωc/2)/tan(ω/2))^(2N))`
+- **BPF:** `S = (tan²(ω/2) - tan(ωl/2)·tan(ωh/2)) / (BW·tan(ω/2))`, `|H| = 1/√(1+S^(2N))`
+
+These give exact magnitude for digital Butterworth filters designed via bilinear
+transform — matching scipy.signal.butter output.
+
+### Test Results
+
+```
+$ cuvhs -f 28 --system NTSC --overwrite TAPE_1_10s.u8 /tmp/cuvhs_k1_test
+
+GPU 0: NVIDIA GeForce RTX 3090  (21.8 GB free)
+FFT size: 468750 (field: 468140, pad: +610)  freq bins: 234376  batch: 512
+Batch size: 512 fields (25.9 MB per field, 13285.7 MB total)
+Decode complete: 598 fields in 7.5 seconds (39.9 FPS)
+```
+
+- 39.9 FPS with real K1 computation (vs 54.3 FPS with stub — FFT overhead is ~27%)
+- K2–K7 still stubs (zeroed TBC output)
+- No CUDA errors, no memory issues
+
 ### Next Steps
 
-Implement Kernel 1 (FM Demodulation) — the foundation kernel. Everything downstream
-depends on the demodulated signal. This involves:
-1. Setting up batched cuFFT plans
-2. Precomputing frequency-domain filter coefficients
-3. Implementing the Hilbert transform / FM discrimination
-4. Validating against Python vhs-decode output on the 10s test clip
+1. Validate K1 output against Python vhs-decode reference (PSNR comparison)
+2. ~~Implement K2 (sync pulse detection) — consumes d_demod_05~~ **Done**
+3. Parameterize filters for PAL and tape speed (currently hardcoded NTSC SP)
+
+---
+
+## Kernel 2: Sync Pulse Detection (2026-03-23)
+
+### Overview
+
+Implemented sync pulse detection (K2) — scans the sync-demodulated signal (d_demod_05)
+to find all sync pulses in each field. This is the input to K3 (pulse classification +
+line location assignment).
+
+### Algorithm
+
+Matches Python `findpulses_numba_raw()` from `lddecode/utils.py`:
+
+1. Signal is in Hz after FM demod (d_demod_05)
+2. Threshold at -20 IRE (halfway between blanking and sync tip):
+   - `pulse_threshold_hz = ire0 + hz_ire × (-20)`
+   - NTSC: 3,542,857 Hz
+3. Sequential scan: samples ≤ threshold are "in pulse"
+4. Record (start, length) on rising edge (pulse end)
+5. Skip any pulse starting at sample 0 (matches Python behavior)
+
+One CUDA thread per field — the scan is inherently sequential within a field,
+but all fields in the batch run in parallel.
+
+### IRE-to-Hz Mapping (added to VideoFormat)
+
+VHS FM demodulation maps IRE levels to frequencies:
+
+| Parameter | NTSC | PAL |
+|-----------|------|-----|
+| Hz/IRE | 7,142.857 | 7,000 |
+| 0 IRE (blanking) | 3,685,714 Hz | 4,100,000 Hz |
+| Sync tip IRE | -40 | -42.857 |
+| Sync tip Hz | 3,400,000 | 3,800,000 |
+| Pulse threshold | 3,542,857 (-20 IRE) | 3,950,000 (-20 IRE) |
+
+Formulas (from `vhsdecode/format_defs/vhs.py`):
+- NTSC: `hz_ire = 1e6/140`, `ire0 = 4.4e6 - hz_ire×100`
+- PAL: `vsync_ire = -0.3×(100/0.7)`, `hz_ire = 1e6/(100+(-vsync_ire))`, `ire0 = 4.8e6 - hz_ire×100`
+
+### Output Layout
+
+```
+d_pulse_starts[field * MAX_PULSES + i]  = sample position of pulse start
+d_pulse_lengths[field * MAX_PULSES + i] = pulse length in samples
+d_pulse_count[field]                    = number of pulses found
+```
+
+MAX_PULSES = 800 (NTSC has ~263 HSYNCs + ~18 EQ/VSYNC ≈ 281; 800 is generous for
+noisy signals).
+
+### Pipeline Integration
+
+Updated `pipeline.h` and `pipeline.cu`:
+- Old: single `void* d_pulses` buffer
+- New: three separate buffers — `d_pulse_starts`, `d_pulse_lengths`, `d_pulse_count`
+- Updated `line_locs.h/cu` stub to accept the new interface
+
+### Test Results
+
+```
+$ cuvhs -f 28 --system NTSC --overwrite TAPE_1_10s.u8 /tmp/k2_test
+
+Pulse counts (first 8 fields): 268 267 267 267 267 267 267 267
+Decode complete: 598 fields in 7.9 seconds (37.6 FPS)
+```
+
+- 267-269 pulses per field — exactly expected for NTSC (263 HSYNCs + ~5 EQ/VSYNC)
+- 37.6 FPS (vs 39.9 FPS K1-only — K2 adds negligible overhead since it's one thread/field)
+- No CUDA errors
+
+### Next Steps
+
+1. ~~Implement K3 (pulse classification + line location assignment)~~ **Done**
+2. Validate pulse positions against Python reference
+3. K3 is the hardest kernel: must classify pulses by width, find field boundaries,
+   compute mean line length, and assign line positions
+
+---
+
+## Kernel 3: Pulse Classification + Line Locations (2026-03-23)
+
+### Overview
+
+Implemented pulse classification and line location assignment (K3). This kernel takes
+K2's raw pulse arrays and produces per-line sample positions (linelocs) that downstream
+kernels use to extract individual scanlines from the demodulated signal.
+
+### Architecture: Three-Phase GPU Pipeline
+
+**Phase 1: Classify pulses by width** (parallel, one thread per pulse)
+
+Width ranges (in samples at capture rate, ±0.5 µs tolerance):
+- HSYNC: 4.7 µs ± 0.5 µs → ~118-146 samples at 28 MHz
+- EQ: 2.3 µs ± 0.5 µs → ~50-78 samples
+- VSYNC: 13.55-28.1 µs → ~379-787 samples (generous range for noisy signals)
+
+Matches Python `get_timings()` from `lddecode/core.py`.
+
+**Phase 2: Vblank state machine + mean line length** (one thread per field)
+
+Simplified version of Python `run_vblank_state_machine()`:
+- State transitions: HSYNC → EQ1 → VSYNC → EQ2 → HSYNC
+- Records the index of the first HSYNC after the VSYNC/EQ2 section (reference pulse)
+- Finds longest continuous run of HSYNC pulses
+- Averages HSYNC-to-HSYNC spacing within ±5% of nominal → mean line length
+- Matches Python `computeLineLen()`
+
+**Phase 3: Line location assignment** (one thread per field, sequential)
+
+For each output line (0 to lines_per_frame):
+1. Compute expected position: `ref_position + meanlinelen × (line - ref_line)`
+2. Search forward through HSYNC-only pulses for nearest within tolerance
+3. Snap to real pulse position, or keep interpolated estimate if no match
+4. Tolerance: `meanlinelen / 1.5` (~0.67 line lengths)
+
+Matches Python `valid_pulses_to_linelocs()` from `vhsdecode/sync.pyx`.
+
+### Absolute Positioning
+
+K2 outputs absolute (batch-global) pulse positions rather than field-relative ones.
+K3's linelocs are therefore absolute positions into the contiguous d_demod buffer.
+
+This is necessary because each field's active video extends past the field's data chunk
+boundary — at 28 MHz, the VSYNC appears ~93 lines into the 257-line chunk, leaving
+only ~164 lines of data after it. Active video needs 263 lines, so it reads into the
+next field's data.
+
+Since the batch data is contiguous in GPU VRAM, absolute positions let K5 (TBC resample)
+read across field boundaries naturally. The only edge case is the last field in a batch
+(addressed in K5 with read clamping).
+
+### VHS Tape Speed Variation
+
+The mean line length is computed from actual HSYNC pulse spacing, not assumed from
+nominal timing. On the test tape:
+- Nominal: 1780 samples/line (28 MHz / 15734.264 Hz)
+- Measured: 1819 samples/line (2.2% fast)
+
+This 2.2% speed variation is typical for VHS and would cause severe horizontal distortion
+if the decoder assumed nominal timing. The adaptive measurement ensures correct output
+regardless of tape speed.
+
+### VideoFormat Additions
+
+Added vblank structure parameters:
+- `num_eq_pulses`: 6 (NTSC), 5 (PAL)
+- `field_lines_first`: 263 (NTSC), 312 (PAL)
+- `field_lines_second`: 262 (NTSC), 313 (PAL)
+
+### Test Results
+
+```
+$ cuvhs -f 28 --system NTSC --overwrite TAPE_1_10s.u8 /tmp/k3_test
+
+Field 0: 268 pulses [462..466334], linelocs spacing=1819 samples/line
+Field 1: 267 pulses [469971..935805], linelocs spacing=1818 samples/line
+Decode complete: 598 fields in 6.2 seconds (48.5 FPS)
+```
+
+- Consistent 1818-1819 samples/line spacing across all fields
+- Linelocs properly snapped to real HSYNC pulses where available
+- Lines beyond field data extrapolated from mean line length
+- K3 adds negligible overhead (<1 ms for 512 fields)
+- No CUDA errors
+
+### Next Steps
+
+1. Implement K4 (hsync refinement) — sub-sample cross-correlation
+2. ~~Implement K5 (TBC resample) — cubic interpolation using K3's linelocs~~ **Done**
+3. Add field order detection (first/second field) for interlaced output
+
+---
+
+## Kernel 5: TBC Resample (2026-03-23)
+
+### Overview
+
+Implemented TBC resampling (K5) — the kernel that produces actual visible output. Takes
+the FM-demodulated signal (in Hz domain) and resamples it to the fixed 4×fsc timebase,
+converting to uint16 TBC format compatible with ld-tools.
+
+**First decoded frame from cuVHS is working.**
+
+### Algorithm
+
+One CUDA thread per output pixel (263 lines × 910 samples = 239,330 per field).
+
+For each output pixel at (field, line, col):
+
+1. **Map to input position**: Linear interpolation between linelocs
+   ```
+   line_start = linelocs[active_line_start + line]
+   line_end   = linelocs[active_line_start + line + 1]
+   coord = line_start + (col / output_line_len) * (line_end - line_start)
+   ```
+
+2. **Catmull-Rom cubic interpolation** at `coord` in d_demod:
+   ```
+   a = p2 - p0
+   b = 2*p0 - 5*p1 + 4*p2 - p3
+   c = 3*(p1 - p2) + p3 - p0
+   value = p1 + 0.5 * x * (a + x * (b + x * c))
+   ```
+   Matches Python `lddecode/utils.py scale()` exactly.
+
+3. **Hz → uint16 conversion** (ld-tools compatible):
+   ```
+   ire = (hz_value - ire0) / hz_ire - vsync_ire
+   output = clip(ire * output_scale + output_zero, 0, 65535)
+   ```
+
+### Output Scaling (added to VideoFormat)
+
+| Parameter | NTSC | PAL |
+|-----------|------|-----|
+| output_zero (sync tip) | 1024 (0x0400) | 256 (0x0100) |
+| output_scale | 358.4 IRE→uint16 | 376.3 IRE→uint16 |
+| White (100 IRE) | 51200 (0xC800) | 54016 (0xD300) |
+| active_line_start | 10 | 8 |
+
+### Visual Comparison
+
+First frame decoded by cuVHS matches the Python vhs-decode reference output.
+Same scene content, correct geometry, proper brightness range.
+
+Differences vs Python reference:
+- Slightly different brightness (cuVHS mean ~19500 vs Python ~23400 uint16)
+  — likely due to VHS-specific vs laserdisc IRE mapping differences
+- No hsync refinement yet (K4) — slightly rougher horizontal alignment
+- No wow compensation — future spline-based approach like Python
+
+### Test Results
+
+```
+$ cuvhs -f 28 --system NTSC --overwrite TAPE_1_10s.u8 /tmp/k5_test
+
+Decode complete: 598 fields in 6.8 seconds (44.0 FPS)
+Output: 273 MB luma TBC, first frame visually verified
+```
+
+- 44.0 FPS with K1+K2+K3+K5 all active (vs 48.5 K1-K3 only — K5 adds ~10% overhead)
+- 239K output pixels per field × 512 fields = 122M pixels per batch
+- Bounds-checked: pixels beyond batch buffer clamped to output_zero
+- No CUDA errors
+
+### Next Steps
+
+1. Investigate brightness offset vs Python reference (IRE mapping)
+2. ~~Implement K4 (hsync refinement) for better horizontal alignment~~ **Done**
+3. ~~Implement K6 (chroma decode) for color output~~ **Done**
+
+---
+
+## Kernel 4: Hsync Refinement (2026-03-23)
+
+### Overview
+
+Implemented sub-sample hsync refinement (K4) — improves horizontal alignment by finding
+precise zero-crossing positions in the demodulated sync signal, rather than relying on
+K3's pulse-width-based estimates.
+
+### Algorithm: Two-Pass Zero-Crossing Detection
+
+One CUDA thread per line (lines_per_frame × num_fields threads).
+
+**Pass 1: Initial crossing at pulse threshold**
+- Search ±1 µs window around K3's lineloc estimate
+- Find where d_demod_05 crosses `pulse_threshold_hz` (−20 IRE)
+- Linear interpolation between adjacent samples for sub-sample accuracy
+
+**Pass 2: Adaptive midpoint crossing**
+- Measure sync level: median of samples 1.0–2.5 µs after initial crossing
+- Measure porch level: median of samples 8.0–9.0 µs after initial crossing
+- Midpoint = (sync + porch) / 2
+- Re-find crossing at midpoint level for better accuracy
+- Sanity check: refined position must be within ±0.5 µs of initial estimate
+
+The two-pass approach handles signal amplitude variation between lines — each line
+gets its own sync/porch reference levels rather than assuming a fixed threshold.
+
+**Device functions:**
+- `find_zero_crossing()` — linear interpolation between adjacent samples
+- `window_median()` — bubble-sort-based median for small windows (max 64 elements)
+
+### Test Results
+
+```
+$ cuvhs -f 28 --system NTSC --overwrite TAPE_1_10s.u8 /tmp/k4_test
+
+Decode complete: 598 fields in 7.0 seconds (42.8 FPS)
+```
+
+- 42.8 FPS (vs 44.0 K1-K3+K5 only — K4 adds ~3% overhead)
+- Visual improvement in horizontal alignment vs K3-only linelocs
+- No CUDA errors
+
+---
+
+## Kernel 6: Chroma Decode (2026-03-24)
+
+### Overview
+
+Implemented VHS color-under chroma decoding (K6) — extracts the heterodyned chroma signal
+from the raw RF, upconverts to colorburst frequency, and produces the chroma TBC output.
+
+### VHS Color-Under Encoding
+
+VHS records chroma by heterodyning the colorburst signal down to a low-frequency carrier:
+- NTSC: fsc (3.579545 MHz) → 629 kHz under-carrier
+- PAL: fsc (4.433619 MHz) → 626 kHz under-carrier
+
+The decoder reverses this: multiply by (fsc + chroma_under) to shift back up, then
+bandpass at fsc to extract the chroma.
+
+### Pipeline (all GPU, per-line batched cuFFT)
+
+```
+Raw RF signal (d_raw)
+  |
+  +--> TBC resample via linelocs (Catmull-Rom cubic, same as K5)
+  +--> Heterodyne: multiply by -cos(2π × (fsc + chroma_under) / output_rate × col)
+  +--> Per-line R2C FFT (cuFFT batched D2Z)
+  +--> Bandpass: zero bins outside fsc ± 500 kHz
+  +--> Per-line C2R IFFT (cuFFT batched Z2D)
+  +--> ACC normalization: burst_abs_ref / burst_rms per line
+  +--> Convert to uint16 centered at 32768
+```
+
+### Three CUDA Kernels
+
+**k_resample_raw_het** — TBC resample + heterodyne multiplication
+- One thread per output sample (chunk_lines × fft_size)
+- Maps output (field, line, col) → raw RF position via linelocs
+- Catmull-Rom cubic interpolation from d_raw
+- Multiplied by heterodyne carrier in same kernel (fused)
+- Zero-pads beyond output_line_len to fft_size
+
+**k_chroma_bandpass** — frequency-domain bandpass
+- One thread per frequency bin
+- Zeros all bins outside fsc ± 500 kHz (~bandwidth_bins)
+
+**k_chroma_acc_output** — ACC normalization + uint16 output
+- One block per line (blockDim.x = 256)
+- Shared-memory reduction for burst RMS measurement
+- ACC scale = burst_abs_ref / burst_rms (per-line gain normalization)
+- Output: `clip(chroma × fft_scale × acc_scale + 32768, 0, 65535)`
+
+### Dynamic FFT Sizing
+
+FFT size = next power-of-2 ≥ output_line_len:
+- NTSC: 910 → 1024
+- PAL: 1135 → 2048
+
+This avoids poor cuFFT performance on non-smooth FFT sizes while keeping
+transforms small (per-line, not per-field).
+
+### VRAM-Aware Chunking
+
+Each line of temp data requires:
+- het buffer: fft_size × 8 bytes (double)
+- FFT buffer: freq_bins × 16 bytes (cufftDoubleComplex)
+- NTSC: 1024×8 + 513×16 = 16,400 bytes/line
+- PAL: 2048×8 + 1025×16 = 32,800 bytes/line
+
+The decoder queries `cudaMemGetInfo()` to determine available VRAM, uses 80% for
+temp buffers, and processes in field-aligned chunks. Additional cap at 4096 lines
+(~15 NTSC fields) to avoid cuFFT plan creation failures with very large batch counts.
+
+Last chunk may be smaller — cuFFT plans are recreated when batch size changes.
+
+### VideoFormat Additions
+
+Added burst timing parameters (system-specific, not hardcoded):
+- `burst_start_us`: 5.3 µs (NTSC), 5.6 µs (PAL)
+- `burst_end_us`: 7.8 µs (NTSC), 7.85 µs (PAL)
+- `burst_abs_ref`: 4416 (NTSC SP), 5000 (PAL)
+
+### Test Results
+
+```
+$ cuvhs -f 28 --system NTSC --overwrite TAPE_1_10s.u8 /tmp/k6_test
+
+Decode complete: 598 fields in 7.1 seconds (42.2 FPS)
+Output: 286 MB luma TBC, 286 MB chroma TBC
+```
+
+- 42.2 FPS with K1-K6 all active (vs 42.8 K1-K5 — K6 adds minimal overhead)
+- Chroma values centered at ~32768 (correct for AC chroma signal)
+- Burst region shows clear sinusoidal oscillation (~28K–38K swing around 32768)
+- Active video shows chroma content varying by scene color
+- Ready for ld-chroma-decoder to demodulate into U/V color components
+
+### Known Limitation
+
+RF filter parameters in K1 (fm_demod.cu) are currently hardcoded for NTSC SP
+(bandpass frequencies, deemphasis constants). PAL and LP/EP tape speeds will need
+parameterized filter coefficients — planned for Phase 3.
+
+### Next Steps
+
+1. ~~Implement K7 (dropout detection) — last remaining kernel~~ **Done**
+2. Validate against Python vhs-decode reference (chroma PSNR)
+3. Parameterize K1 filters for PAL/LP/EP (Phase 3)
+
+---
+
+## Kernel 7: Dropout Detection + Concealment (2026-03-24)
+
+### Overview
+
+Implemented RF dropout detection with inline concealment (K7) — the final kernel in the
+pipeline. Detects signal dropouts from the raw RF envelope, maps them to TBC line/column
+positions for ld-tools compatible metadata, and conceals affected pixels by copying from
+adjacent lines.
+
+Unlike the Python vhs-decode reference (which only records metadata and defers concealment
+to the separate `ld-dropout-correct` tool), cuVHS conceals inline. This eliminates a
+post-processing step and is especially valuable in streaming mode where there's no TBC
+file on disk to run correction against. The concealment kernel adds negligible overhead.
+
+### Algorithm (matches Python vhs-decode doc.py)
+
+**Detection parameters** (same defaults as Python):
+- Threshold: 18% of field mean envelope (`DOD_THRESHOLD_P = 0.18`)
+- Hysteresis: 1.25× (`DOD_HYSTERESIS = 1.25`)
+- Merge distance: 30 RF samples (`DOD_MERGE_DIST = 30`)
+- Minimum length: 10 RF samples (`DOD_MIN_LENGTH = 10`)
+
+### Three CUDA Kernels
+
+**k_field_mean_sq** — parallel reduction (one block per field, 256 threads)
+- Computes mean(raw²) per field using warp shuffle + shared memory reduction
+- Output: one `double` per field — the mean squared RF amplitude
+- This is the RF envelope reference level for thresholding
+
+**k_detect_and_map** — sequential scan (one thread per field)
+- Scans raw RF signal in blocks of 16 samples (ENV_BLOCK_SIZE)
+- Computes block mean squared and compares against squared thresholds
+  (avoids sqrt in inner loop)
+- Hysteresis state machine: dropout starts when block_mean_sq ≤ down_thresh²,
+  ends when block_mean_sq ≥ up_thresh²
+- Post-scan: merges nearby dropouts (< 30 samples apart), filters short ones (< 10 samples)
+- Maps RF positions to TBC line/column via binary search over linelocs
+- Multi-line dropouts expand to one TBC entry per affected line
+- Output: per-field arrays of (line, startx, endx) in global memory
+
+**k_conceal** — parallel concealment (one block per field, 128 threads)
+- Reads the dropout map produced by k_detect_and_map
+- For each dropout entry: copies pixels from adjacent line (line above, or below for line 0)
+- Applies to both luma and chroma TBC buffers
+- Threads distribute across dropout entries within each field
+
+### RF Envelope Approach
+
+The raw RF signal contains the FM carrier. Its amplitude (RMS over a small window) is
+the RF envelope. During a dropout, the tape oxide is damaged/missing and the amplitude
+drops to near-zero.
+
+Rather than computing a full Hilbert envelope (which would require another FFT pass),
+K7 uses block-based RMS with 16-sample blocks (~0.57 µs at 28 MHz, roughly half a
+carrier cycle). This gives sub-microsecond dropout boundary resolution without storing
+a separate envelope buffer.
+
+The threshold comparison uses squared values throughout (block_mean_sq vs threshold²)
+to avoid expensive sqrt calls in the scan loop.
+
+### RF → TBC Position Mapping
+
+Each RF-domain dropout (start_rf, end_rf) is mapped to TBC coordinates using the
+linelocs computed by K3/K4:
+
+1. Binary search linelocs to find first and last affected TBC output line
+2. Scale RF offset within line to TBC column:
+   `startx = (start_rf - line_start) / (line_end - line_start) × output_line_len`
+3. Multi-line dropouts produce one (line, startx, endx) entry per affected line
+4. Results stored in GPU global memory, downloaded to host for JSON metadata
+
+### Pipeline Integration
+
+New GPU buffers: `d_do_lines`, `d_do_starts`, `d_do_ends`, `d_do_count`
+(MAX_DROPOUTS_PER_FIELD = 512 entries per field, ~6 KB per field — negligible).
+
+After K7, dropout metadata is downloaded to host alongside the TBC data and recorded
+via `writer.add_dropout()` for each entry. The JSON output follows the ld-tools format:
+
+```json
+{
+  "dropOuts": {
+    "fieldLine": [29, 30, 31],
+    "startx": [92, 0, 0],
+    "endx": [910, 910, 745]
+  }
+}
+```
+
+### Test Results
+
+**Clean tape (10-second NTSC clip):**
+```
+$ cuvhs -f 28 --system NTSC --overwrite TAPE_1_10s.u8 /tmp/k7_test
+
+Decode complete: 598 fields in 7.4 seconds (40.3 FPS)
+Fields with dropouts: 0
+```
+Zero dropouts — confirmed by manual inspection: minimum block RMS (8732) is well above
+the 18% threshold (2587). This tape section is genuinely clean.
+
+**Synthetic dropout injection:**
+Injected a 5000-sample silence (RF amplitude = 0) at byte offset 5,000,000 in the
+test clip. K7 correctly detected and mapped it:
+
+```
+Field 10: 3 dropout entries
+  line 29: cols 92-910
+  line 30: cols 0-910  (full line)
+  line 31: cols 0-745
+```
+
+Concealment verified: all dropout pixels in lines 29-31 replaced with values from
+line 28 (adjacent clean line). Exact match confirmed for columns 200-800.
+
+Note: FM demod ringing causes minor artifacts on line 28 (adjacent to dropout) that
+aren't detected as dropouts because the RF envelope stays above threshold. This matches
+Python vhs-decode behavior — it's an inherent limitation of RF-domain detection.
+
+**30-second random section (~60% into tape):**
+```
+$ cuvhs -f 28 --system NTSC --overwrite tape1_30s_random.u8 /tmp/k7_test2
+
+Decode complete: 1794 fields in 20.4 seconds (44.0 FPS)
+Fields with dropouts: 0
+```
+Also clean — this tape is in good condition.
+
+### Performance
+
+40.3 FPS with all 7 kernels active (vs 42.2 FPS K1-K6 only). K7 adds ~5% overhead,
+dominated by the sequential per-field scan through 468K raw samples. The concealment
+kernel is essentially free.
+
+### What K7 Does NOT Detect
+
+- **Tracking errors**: Timing misalignment where the head reads edge of adjacent track.
+  RF envelope stays strong, signal is just wrong. Visible as horizontal streaks.
+- **Head switching transients**: Brief disturbance at head rotation boundary.
+  Same issue — signal present but discontinuous.
+- **Chroma crosstalk**: Adjacent-track color leakage. Not an amplitude dropout.
+
+These would require different detection strategies (timing analysis, not envelope
+thresholding).
+
+### tbc-video-export Flag Reference (Lesson Learned)
+
+**Flags:**
+- `-s N` / `--start N` — start at **frame** N (NOT field N)
+- `-l N` / `--length N` — export N **frames**
+- `--ffll N` — first visible field line (default 20 for NTSC, range 1-259)
+- `--lfll N` — last visible field line (default 259 for NTSC, range 1-259)
+
+**Correct usage for exporting frame 5:**
+```bash
+tbc-video-export -s 1 -l 5 output.tbc export.mkv
+ffmpeg -y -i export.mkv -frames:v 5 frame%02d.png
+# frame05.png = frame 5
+```
+
+**The mistake:** `-s` was assumed to be a field number. `-s 9 -l 2` was used
+thinking it would select fields 9+10 (= frame 5). In reality `-s 9` starts at
+**frame 9**, so the export contained frames 9-10, not frame 5. Every A/B
+comparison during the K4 hsync bad-line fix work (v1 through v7) compared
+frame 9 against frame 5 — completely different video content. This made it
+impossible to evaluate whether code changes helped or hurt.
+
+**Proven empirically:**
+```
+-s 9 -l 2, ffmpeg frame 0  =  -s 1 -l 10, ffmpeg frame 9   (bitwise identical)
+-s 9 -l 2, ffmpeg frame 0  ≠  -s 1 -l 5, ffmpeg frame 5    (completely different)
+```
+
+**Rule:** Always use `-s 1 -l N` and select by ffmpeg frame number. Never use
+`-s` to seek to a specific field — it's frame-based.
+
+### Next Steps
+
+1. Validate full pipeline against Python vhs-decode reference (PSNR comparison)
+2. Parameterize K1 filters for PAL/LP/EP (Phase 3)
+3. Optimization: CUDA streams, kernel fusion, PCIe overlap (Phase 6)

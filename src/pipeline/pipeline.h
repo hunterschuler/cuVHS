@@ -3,6 +3,10 @@
 #include "format/video_format.h"
 #include "io/raw_reader.h"
 #include "io/tbc_writer.h"
+#include "pipeline/fm_demod.h"
+#include "pipeline/sync_pulses.h"
+#include "pipeline/dropout_detect.h"
+#include "pipeline/dropout_detect.h"
 
 // Orchestrates the full decode pipeline on GPU.
 //
@@ -36,15 +40,26 @@ private:
     // Batch sizing determined at runtime from available VRAM
     int batch_size = 0;
 
+    // Kernel 1: FM demodulation (persistent state — cuFFT plans + filter arrays)
+    FMDemodState demod_state;
+
     // GPU buffer pointers (allocated in run(), freed in destructor)
     // These are device pointers.
     void* d_raw = nullptr;         // raw input samples (batch)
     void* d_demod = nullptr;       // FM demod output (float64, batch)
     void* d_demod_05 = nullptr;    // sync demod output (float64, batch)
-    void* d_pulses = nullptr;      // pulse arrays (batch)
+    void* d_pulse_starts = nullptr;  // pulse start positions (batch x MAX_PULSES ints)
+    void* d_pulse_lengths = nullptr; // pulse lengths (batch x MAX_PULSES ints)
+    void* d_pulse_count = nullptr;   // pulse count per field (batch ints)
     void* d_linelocs = nullptr;    // line locations (batch)
     void* d_tbc_luma = nullptr;    // TBC luma output (uint16, batch)
     void* d_tbc_chroma = nullptr;  // TBC chroma output (uint16, batch)
+
+    // Kernel 7: Dropout detection output (TBC-mapped dropout entries)
+    void* d_do_lines = nullptr;    // dropout line indices (batch x MAX_DROPOUTS_PER_FIELD)
+    void* d_do_starts = nullptr;   // dropout start columns
+    void* d_do_ends = nullptr;     // dropout end columns
+    void* d_do_count = nullptr;    // dropout count per field
 
     size_t bytes_per_field() const;
     bool allocate_buffers();

@@ -1,15 +1,22 @@
 #pragma once
 #include "format/video_format.h"
 
-// Kernel 4: Refine Line Locations via Hsync Correlation
+// Kernel 4: Refine Line Locations via Hsync Zero-Crossing
 //
-// For each scanline, cross-correlate a window around the estimated line start
-// with an ideal hsync waveform to find the sub-sample-accurate position.
+// Two-pass zero-crossing detection on demod_05 (sync signal in Hz domain):
 //
-// This replaces the Cython refine_linelocs_hsync() in the Python decoder.
+//   Pass 1: Find initial zero-crossing at pulse threshold (-20 IRE)
+//           within ±1 µs of the estimated lineloc.
 //
-// N_fields × lines_per_field × ~40-sample correlations = embarrassingly parallel.
+//   Pass 2: Measure actual sync and porch levels from the signal,
+//           then find refined crossing at (sync + porch) / 2 midpoint.
+//           Linear interpolation between samples for sub-sample accuracy.
+//
+// Matches Python refine_linelocs_hsync() from vhsdecode/sync.pyx.
+//
+// One CUDA thread per line (num_fields × lines_per_frame).
 void hsync_refine(const double* d_demod_05,
                   double* d_linelocs,
                   int num_fields,
+                  int total_demod_samples,
                   const VideoFormat& fmt);

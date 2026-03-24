@@ -83,7 +83,22 @@ bool TBCWriter::finalize() {
     }
 
     const char* sys_name = (fmt.system == VideoSystem::NTSC) ? "NTSC" : "PAL";
-    int color_burst = (fmt.system == VideoSystem::NTSC) ? 227 : 283;
+
+    // Compute ld-tools compatible metadata values
+    // black16bIre: uint16 value at 0 IRE (blanking level)
+    // white16bIre: uint16 value at 100 IRE (peak white)
+    // Formula: output = (ire_shifted * output_scale) + output_zero
+    //   where ire_shifted = ire - vsync_ire (shift so sync tip = 0)
+    double black16b = (0.0 - fmt.vsync_ire) * fmt.output_scale + fmt.output_zero;
+    double white16b = (100.0 - fmt.vsync_ire) * fmt.output_scale + fmt.output_zero;
+
+    // Burst and active video positions (in output samples)
+    int burst_start = (int)(fmt.burst_start_us * 1e-6 * fmt.output_rate + 0.5);
+    int burst_end   = (int)(fmt.burst_end_us * 1e-6 * fmt.output_rate + 0.5);
+
+    // Active video: ~9.4 µs to ~62.5 µs for NTSC (standard values from vhs-decode)
+    int active_start = (fmt.system == VideoSystem::NTSC) ? 134 : 185;
+    int active_end   = (fmt.system == VideoSystem::NTSC) ? 894 : 1107;
 
     fprintf(fp, "{\n");
     fprintf(fp, "  \"videoParameters\": {\n");
@@ -91,10 +106,16 @@ bool TBCWriter::finalize() {
     fprintf(fp, "    \"isSubcarrierLocked\": false,\n");
     fprintf(fp, "    \"isSourcePal\": %s,\n", (fmt.system == VideoSystem::PAL) ? "true" : "false");
     fprintf(fp, "    \"numberOfSequentialFields\": %d,\n", field_count);
-    fprintf(fp, "    \"colourBurstStart\": %d,\n", color_burst);
+    fprintf(fp, "    \"black16bIre\": %.1f,\n", black16b);
+    fprintf(fp, "    \"white16bIre\": %.1f,\n", white16b);
     fprintf(fp, "    \"sampleRate\": %.0f,\n", fmt.output_rate);
     fprintf(fp, "    \"fieldWidth\": %d,\n", fmt.output_line_len);
     fprintf(fp, "    \"fieldHeight\": %d,\n", fmt.output_field_lines);
+    fprintf(fp, "    \"colourBurstStart\": %d,\n", burst_start);
+    fprintf(fp, "    \"colourBurstEnd\": %d,\n", burst_end);
+    fprintf(fp, "    \"activeVideoStart\": %d,\n", active_start);
+    fprintf(fp, "    \"activeVideoEnd\": %d,\n", active_end);
+    fprintf(fp, "    \"tapeFormat\": \"VHS\",\n");
     fprintf(fp, "    \"isMapped\": false\n");
     fprintf(fp, "  },\n");
 
