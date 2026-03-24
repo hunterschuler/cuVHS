@@ -254,6 +254,7 @@ bool Pipeline::run() {
 
     // Progress display: print two lines initially so \033[A can move up
     fprintf(stderr, "\n\n");
+    fflush(stderr);
 
     while (true) {
         int fields_this_batch = batch_size;
@@ -301,6 +302,7 @@ bool Pipeline::run() {
                     total_fields, total_fields_est, pct, fps, eta_min, eta_sec);
             fprintf(stderr, "\033[K  [%s]\n", bar);
         }
+        fflush(stderr);
     }
 
     auto t_end = std::chrono::steady_clock::now();
@@ -310,6 +312,7 @@ bool Pipeline::run() {
     fprintf(stderr, "\033[2A\033[K");
     fprintf(stderr, "Decode complete: %d fields in %.1f seconds (%.1f FPS)\n\033[K\n",
             total_fields, total_time, (total_fields / 2.0) / total_time);
+    fflush(stderr);
 
     writer.finalize();
     return true;

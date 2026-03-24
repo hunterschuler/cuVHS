@@ -4,12 +4,12 @@
 #include <cstdio>
 #include <cmath>
 #include <algorithm>
+#include <vector>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
 
-// Compute next power of 2 >= n
 static int next_pow2(int n) {
     int v = 1;
     while (v < n) v <<= 1;
@@ -17,14 +17,14 @@ static int next_pow2(int n) {
 }
 
 // ============================================================================
-// Phase 1: TBC resample raw signal + heterodyne multiplication
+// Kernel: TBC resample raw signal + heterodyne with per-field phase control
 // ============================================================================
 
 __global__ void k_resample_raw_het(
     const double* __restrict__ raw,
     const double* __restrict__ linelocs,
     double* __restrict__ out,           // [chunk_lines × fft_size]
-    int chunk_lines,                    // lines in this chunk
+    int chunk_lines,
     int field_offset,                   // first field index in this chunk
     int output_field_lines,
     int lines_per_frame,
@@ -33,7 +33,8 @@ __global__ void k_resample_raw_het(
     int active_line_start,
     int total_raw_samples,
     double het_scale,
-    int phase_rotation)                 // per-line phase step: 1 or 3 (VHS NTSC)
+    const int* __restrict__ field_track,        // per-field: 0 or 1
+    const int* __restrict__ field_phase_offset) // per-field: 0-3 (NTSC sequence offset)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total_samples = chunk_lines * fft_size;
@@ -42,21 +43,19 @@ __global__ void k_resample_raw_het(
     int line_local = idx / fft_size;
     int col = idx % fft_size;
 
-    // Zero padding region
     if (col >= output_line_len) {
         out[idx] = 0.0;
         return;
     }
 
-    // Decompose into field and output line (relative to chunk start)
     int abs_line = field_offset * output_field_lines + line_local;
     int field = abs_line / output_field_lines;
     int out_line = abs_line % output_field_lines;
 
     int ll_line = out_line + active_line_start;
     int ll_next = ll_line + 1;
-
     int ll_base = field * lines_per_frame;
+
     if (ll_next >= lines_per_frame) {
         out[idx] = 0.0;
         return;
@@ -68,7 +67,6 @@ __global__ void k_resample_raw_het(
     double frac = (double)col / (double)output_line_len;
     double coord = line_start + frac * (line_end - line_start);
 
-    // Catmull-Rom cubic interpolation from raw signal
     int ci = (int)coord;
     double x = coord - (double)ci;
 
@@ -87,21 +85,25 @@ __global__ void k_resample_raw_het(
     double c = 3.0 * (p1 - p2) + p3 - p0;
     double raw_val = p1 + 0.5 * x * (a + x * (b + x * c));
 
-    // Heterodyne: multiply by -cos(2π × het_scale × col + line_phase)
-    // VHS uses per-line phase rotation (±90° per line) to reduce crosstalk.
-    // Track 0 uses rotation=3 (-90°/line), Track 1 uses rotation=1 (+90°/line).
-    // phase_rotation encodes which rotation to use for even fields (0 or 1).
-    int track = (field + phase_rotation) & 1;
-    int rot = track ? 1 : 3;  // +90° or -90° per line
-    int line_phase = (out_line * rot) & 3;
+    // Per-line phase: track rotation + NTSC phase offset
+    // VHS NTSC: Track 0 → rot=3 (-90°/line), Track 1 → rot=1 (+90°/line)
+    int track = field_track[field];
+    int rot = track ? 1 : 3;
+    int phase_off = field_phase_offset[field];
+    int line_phase = (out_line * rot + phase_off) & 3;
     double phase_offset = (double)line_phase * (M_PI * 0.5);
-    double het = -cos(2.0 * M_PI * het_scale * (double)col + phase_offset);
+
+    // Use absolute sample position within field for continuous phase.
+    // Python generates het carrier across full field; col-only resets
+    // phase each line, creating a 171° discontinuity per line.
+    double abs_sample = (double)(out_line * output_line_len + col);
+    double het = -cos(2.0 * M_PI * het_scale * abs_sample + phase_offset);
 
     out[idx] = raw_val * het;
 }
 
 // ============================================================================
-// Phase 2: Frequency-domain bandpass centered at fsc
+// Kernel: Frequency-domain bandpass centered at fsc
 // ============================================================================
 
 __global__ void k_chroma_bandpass(
@@ -116,7 +118,6 @@ __global__ void k_chroma_bandpass(
     if (idx >= total) return;
 
     int bin = idx % freq_bins;
-
     int lo = fsc_bin - bandwidth_bins;
     int hi = fsc_bin + bandwidth_bins;
 
@@ -127,12 +128,12 @@ __global__ void k_chroma_bandpass(
 }
 
 // ============================================================================
-// Phase 3: ACC normalization + uint16 output
+// Kernel: ACC normalization + uint16 output
 // ============================================================================
 
 __global__ void k_chroma_acc_output(
-    const double* __restrict__ chroma,   // [chunk_lines × fft_size]
-    uint16_t* __restrict__ tbc_chroma,   // output (offset into batch output)
+    const double* __restrict__ chroma,
+    uint16_t* __restrict__ tbc_chroma,
     int chunk_lines,
     int output_line_len,
     int fft_size,
@@ -177,7 +178,203 @@ __global__ void k_chroma_acc_output(
 
 
 // ============================================================================
-// Host entry point — processes in VRAM-aware chunks
+// Host-side: Track detection + NTSC phase sequence
+// ============================================================================
+
+// NTSC 4-frame (8-field) phase rotation sequence lookup.
+// Key: (is_first_field, burst_phase_quadrant, phase_delta_from_prev)
+// Value: (field_phase_id, phase_offset_to_add)
+// phase_delta = -1 means unknown (no previous field to compare)
+struct NTSCPhaseEntry {
+    int is_first;   // 1 = first field, 0 = second
+    int quadrant;   // 0-3 (burst phase / 90°)
+    int delta;      // 0-3 or -1 (unknown)
+    int phase_id;   // field_phase_id (informational)
+    int offset;     // phase rotation offset to apply (0-3)
+};
+
+static const NTSCPhaseEntry ntsc_phase_table[] = {
+    // frame 1
+    {1, 2,  0, 3, 0}, {0, 3,  1, 2, 1},
+    // frame 2
+    {1, 1,  2, 1, 1}, {0, 0,  3, 4, 0},
+    // frame 3
+    {1, 0,  0, 3, 2}, {0, 1,  1, 2, 3},
+    // frame 4
+    {1, 3,  2, 1, 3}, {0, 2,  3, 4, 2},
+    // copies without phase delta (for first field in decode, no prior)
+    {1, 2, -1, 3, 0}, {0, 3, -1, 2, 1},
+    {1, 1, -1, 1, 1}, {0, 0, -1, 4, 0},
+    {1, 0, -1, 3, 2}, {0, 1, -1, 2, 3},
+    {1, 3, -1, 1, 3}, {0, 2, -1, 4, 2},
+};
+static const int NTSC_PHASE_TABLE_SIZE = sizeof(ntsc_phase_table) / sizeof(ntsc_phase_table[0]);
+
+static int lookup_ntsc_phase_offset(int is_first, int quadrant, int delta) {
+    // Try with delta first
+    for (int i = 0; i < NTSC_PHASE_TABLE_SIZE; i++) {
+        if (ntsc_phase_table[i].is_first == is_first &&
+            ntsc_phase_table[i].quadrant == quadrant &&
+            ntsc_phase_table[i].delta == delta) {
+            return ntsc_phase_table[i].offset;
+        }
+    }
+    // Fallback: try without delta
+    for (int i = 0; i < NTSC_PHASE_TABLE_SIZE; i++) {
+        if (ntsc_phase_table[i].is_first == is_first &&
+            ntsc_phase_table[i].quadrant == quadrant &&
+            ntsc_phase_table[i].delta == -1) {
+            return ntsc_phase_table[i].offset;
+        }
+    }
+    return 0;  // fallback
+}
+
+// Measure burst cancellation metric for track detection.
+// In NTSC, burst alternates 180° per line. With correct track phase,
+// summing adjacent-line bursts should cancel (low metric).
+// With wrong track phase, they add constructively (high metric).
+static double measure_burst_cancellation(
+    const double* h_chroma,  // host buffer: output_field_lines × fft_size
+    int output_field_lines,
+    int fft_size,
+    int output_line_len,
+    int burst_start,
+    int burst_end,
+    double fft_scale)
+{
+    const int SKIP = 16;  // skip first/last 16 lines (vblank, head switch)
+    int burst_len = burst_end - burst_start;
+    double total = 0.0;
+    int count = 0;
+
+    for (int line = SKIP; line < output_field_lines - SKIP - 1; line += 2) {
+        const double* line_a = h_chroma + (size_t)line * fft_size;
+        const double* line_b = h_chroma + (size_t)(line + 1) * fft_size;
+
+        double sum = 0.0;
+        for (int i = burst_start; i < burst_end && i < output_line_len; i++) {
+            double a = line_a[i] * fft_scale;
+            double b = line_b[i] * fft_scale;
+            sum += fabs(a + b);
+        }
+        total += sum / burst_len;
+        count++;
+    }
+    return (count > 0) ? total / count : 1e9;
+}
+
+// Measure burst phase via I/Q product detection.
+// Returns burst phase in degrees (0-360).
+static double measure_burst_phase(
+    const double* h_chroma,
+    int output_field_lines,
+    int fft_size,
+    int output_line_len,
+    int burst_start,
+    int burst_end,
+    double fft_scale,
+    double fsc,
+    double output_rate)
+{
+    const int SKIP = 16;
+    double I_total = 0.0, Q_total = 0.0;
+
+    for (int line = SKIP; line < output_field_lines - SKIP; line++) {
+        const double* line_data = h_chroma + (size_t)line * fft_size;
+        double I = 0.0, Q = 0.0;
+
+        for (int i = burst_start; i < burst_end && i < output_line_len; i++) {
+            double val = line_data[i] * fft_scale;
+            double t = 2.0 * M_PI * fsc / output_rate * (double)i;
+            I += val * cos(t);
+            Q += val * sin(t);
+        }
+
+        double mag = sqrt(I * I + Q * Q);
+        if (mag > 0.0) {
+            I_total += I / mag;
+            Q_total += Q / mag;
+        }
+    }
+
+    double phase_rad = atan2(Q_total, I_total);
+    double phase_deg = fmod(phase_rad * 180.0 / M_PI + 360.0, 360.0);
+    return phase_deg;
+}
+
+// Process a single field through the full chroma pipeline and return
+// the time-domain output in h_out (host buffer).
+static void process_one_field_chroma(
+    const double* d_raw,
+    const double* d_linelocs,
+    double* d_het_buf,
+    cufftDoubleComplex* d_fft_buf,
+    double* h_out,
+    int field_idx,
+    int track,
+    int phase_offset,
+    int output_field_lines,
+    int lines_per_frame,
+    int output_line_len,
+    int fft_size,
+    int freq_bins,
+    int active_line_start,
+    int total_raw_samples,
+    double het_scale,
+    int fsc_bin,
+    int bandwidth_bins,
+    int* d_field_track,
+    int* d_field_phase_offset)
+{
+    int lines = output_field_lines;
+
+    // Upload track + phase offset for this field
+    cudaMemcpy(d_field_track + field_idx, &track, sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_field_phase_offset + field_idx, &phase_offset, sizeof(int), cudaMemcpyHostToDevice);
+
+    // Resample + heterodyne
+    {
+        int total = lines * fft_size;
+        int threads = 256;
+        int blocks = (total + threads - 1) / threads;
+        k_resample_raw_het<<<blocks, threads>>>(
+            d_raw, d_linelocs, d_het_buf,
+            lines, field_idx, output_field_lines,
+            lines_per_frame, output_line_len, fft_size,
+            active_line_start, total_raw_samples, het_scale,
+            d_field_track, d_field_phase_offset);
+    }
+
+    // Forward FFT (need a temporary plan for 1 field)
+    cufftHandle plan_r2c, plan_c2r;
+    int n[] = { fft_size };
+    cufftPlanMany(&plan_r2c, 1, n, NULL, 1, fft_size, NULL, 1, freq_bins, CUFFT_D2Z, lines);
+    cufftPlanMany(&plan_c2r, 1, n, NULL, 1, freq_bins, NULL, 1, fft_size, CUFFT_Z2D, lines);
+
+    cufftExecD2Z(plan_r2c, d_het_buf, d_fft_buf);
+
+    // Bandpass
+    {
+        int total = lines * freq_bins;
+        int threads = 256;
+        int blocks = (total + threads - 1) / threads;
+        k_chroma_bandpass<<<blocks, threads>>>(d_fft_buf, lines, freq_bins, fsc_bin, bandwidth_bins);
+    }
+
+    // Inverse FFT
+    cufftExecZ2D(plan_c2r, d_fft_buf, d_het_buf);
+
+    // Download to host
+    cudaMemcpy(h_out, d_het_buf, (size_t)lines * fft_size * sizeof(double), cudaMemcpyDeviceToHost);
+
+    cufftDestroy(plan_r2c);
+    cufftDestroy(plan_c2r);
+}
+
+
+// ============================================================================
+// Host entry point
 // ============================================================================
 
 void chroma_decode(const double* d_raw,
@@ -189,42 +386,139 @@ void chroma_decode(const double* d_raw,
 {
     int output_field_lines = fmt.output_field_lines;
     int output_line_len = fmt.output_line_len;
-
-    // Compute FFT size: next power-of-2 >= output_line_len
     int fft_size = next_pow2(output_line_len);
     int freq_bins = fft_size / 2 + 1;
 
-    // Heterodyne frequency: fsc + chroma_under
     double het_freq = fmt.fsc + fmt.chroma_under;
     double het_scale = het_freq / fmt.output_rate;
 
-    // FSC bin in FFT
     int fsc_bin = (int)(fmt.fsc / fmt.output_rate * fft_size + 0.5);
-
-    // Bandwidth: ~500 kHz
     int bandwidth_bins = (int)(500000.0 / fmt.output_rate * fft_size + 0.5);
     if (bandwidth_bins < 10) bandwidth_bins = 10;
 
-    // Burst window (samples at output rate, from VideoFormat)
     int burst_start = (int)(fmt.burst_start_us * 1e-6 * fmt.output_rate + 0.5);
     int burst_end   = (int)(fmt.burst_end_us * 1e-6 * fmt.output_rate + 0.5);
 
+    double fft_scale = 1.0 / (double)fft_size;
+
+    // ---------------------------------------------------------------
+    // Allocate per-field track and phase offset arrays (GPU)
+    // ---------------------------------------------------------------
+    int* d_field_track = nullptr;
+    int* d_field_phase_offset = nullptr;
+    cudaMalloc(&d_field_track, num_fields * sizeof(int));
+    cudaMalloc(&d_field_phase_offset, num_fields * sizeof(int));
+
+    // ---------------------------------------------------------------
+    // Step 1: Track auto-detection on first field
+    //
+    // Process field 0 with both track=0 and track=1.
+    // Measure burst cancellation between adjacent lines.
+    // The correct track gives lower metric (bursts cancel in NTSC).
+    // ---------------------------------------------------------------
+
+    // Temp buffers for single-field processing
+    size_t one_field_het_bytes = (size_t)output_field_lines * fft_size * sizeof(double);
+    size_t one_field_fft_bytes = (size_t)output_field_lines * freq_bins * sizeof(cufftDoubleComplex);
+
+    double* d_det_het = nullptr;
+    cufftDoubleComplex* d_det_fft = nullptr;
+    cudaMalloc(&d_det_het, one_field_het_bytes);
+    cudaMalloc(&d_det_fft, one_field_fft_bytes);
+
+    auto* h_det = new double[(size_t)output_field_lines * fft_size];
+
+    double metric[2];
+    for (int try_track = 0; try_track < 2; try_track++) {
+        process_one_field_chroma(
+            d_raw, d_linelocs, d_det_het, d_det_fft, h_det,
+            0, try_track, 0,
+            output_field_lines, fmt.lines_per_frame, output_line_len,
+            fft_size, freq_bins, fmt.active_line_start, total_raw_samples,
+            het_scale, fsc_bin, bandwidth_bins,
+            d_field_track, d_field_phase_offset);
+
+        metric[try_track] = measure_burst_cancellation(
+            h_det, output_field_lines, fft_size, output_line_len,
+            burst_start, burst_end, fft_scale);
+    }
+
+    int detected_track = (metric[1] < metric[0]) ? 1 : 0;
+
+    fprintf(stderr, "  [chroma] Track detect: metric[0]=%.4f metric[1]=%.4f → track=%d\n",
+            metric[0], metric[1], detected_track);
+
+    // ---------------------------------------------------------------
+    // Step 2: NTSC burst phase measurement + 4-frame sequence lookup
+    //
+    // Using the detected track, measure burst phase from field 0.
+    // Look up the NTSC phase rotation offset.
+    // ---------------------------------------------------------------
+
+    // Re-process field 0 with correct track to get clean burst for phase measurement
+    process_one_field_chroma(
+        d_raw, d_linelocs, d_det_het, d_det_fft, h_det,
+        0, detected_track, 0,
+        output_field_lines, fmt.lines_per_frame, output_line_len,
+        fft_size, freq_bins, fmt.active_line_start, total_raw_samples,
+        het_scale, fsc_bin, bandwidth_bins,
+        d_field_track, d_field_phase_offset);
+
+    double burst_phase_0 = measure_burst_phase(
+        h_det, output_field_lines, fft_size, output_line_len,
+        burst_start, burst_end, fft_scale, fmt.fsc, fmt.output_rate);
+
+    int quadrant_0 = ((int)(burst_phase_0 / 90.0 + 0.5)) % 4;
+
+    // Field 0 is assumed first field; no previous burst → delta = -1
+    int phase_offset_0 = lookup_ntsc_phase_offset(1, quadrant_0, -1);
+
+    fprintf(stderr, "  [chroma] Field 0: burst_phase=%.1f° quadrant=%d phase_offset=%d\n",
+            burst_phase_0, quadrant_0, phase_offset_0);
+
+    // ---------------------------------------------------------------
+    // Step 3: Generate per-field track + phase offset arrays
+    //
+    // Track alternates per field. Phase offset follows NTSC 4-frame
+    // sequence — measure burst from field 1 to get delta, then
+    // extrapolate for remaining fields.
+    // ---------------------------------------------------------------
+
+    std::vector<int> h_track(num_fields);
+    std::vector<int> h_phase_offset(num_fields);
+
+    h_track[0] = detected_track;
+    h_phase_offset[0] = 0;  // phase offset disabled for now — isolating track detection
+
+    for (int f = 1; f < num_fields; f++) {
+        h_track[f] = (f & 1) ? (1 - detected_track) : detected_track;
+        h_phase_offset[f] = 0;
+    }
+
+    // Upload to GPU
+    cudaMemcpy(d_field_track, h_track.data(), num_fields * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_field_phase_offset, h_phase_offset.data(), num_fields * sizeof(int), cudaMemcpyHostToDevice);
+
+    // Free detection buffers
+    cudaFree(d_det_het);
+    cudaFree(d_det_fft);
+    delete[] h_det;
+
+    // ---------------------------------------------------------------
+    // Step 4: Full batch chroma processing with correct phases
+    // ---------------------------------------------------------------
+
     // Determine chunk size from available VRAM
-    // Each line needs: fft_size × 8 (het buf) + freq_bins × 16 (fft buf)
     size_t bytes_per_line = (size_t)fft_size * sizeof(double)
                           + (size_t)freq_bins * sizeof(cufftDoubleComplex);
 
     size_t free_mem = 0, total_mem = 0;
     cudaMemGetInfo(&free_mem, &total_mem);
-    // Use at most 80% of free VRAM for chroma temp buffers
     size_t usable = (size_t)(free_mem * 0.8);
 
     int max_lines = (int)(usable / bytes_per_line);
-    if (max_lines < output_field_lines) max_lines = output_field_lines;  // at least 1 field
+    if (max_lines < output_field_lines) max_lines = output_field_lines;
 
-    // Cap chunk size: cuFFT batched plans have practical limits on batch count,
-    // and cuFFT workspace memory isn't accounted for in our VRAM estimate.
-    // 4096 lines (~15 NTSC fields) balances throughput vs plan overhead.
     int max_chunk_lines = 4096;
     max_chunk_lines = (max_chunk_lines / output_field_lines) * output_field_lines;
     if (max_chunk_lines < output_field_lines) max_chunk_lines = output_field_lines;
@@ -232,11 +526,10 @@ void chroma_decode(const double* d_raw,
 
     int total_lines = num_fields * output_field_lines;
     int chunk_lines = std::min(max_lines, total_lines);
-    // Round down to multiple of output_field_lines for clean field boundaries
     chunk_lines = (chunk_lines / output_field_lines) * output_field_lines;
     if (chunk_lines < output_field_lines) chunk_lines = output_field_lines;
 
-    // Allocate temp buffers for one chunk
+    // Allocate temp buffers
     double* d_het_buf = nullptr;
     cufftDoubleComplex* d_fft_buf = nullptr;
 
@@ -246,98 +539,61 @@ void chroma_decode(const double* d_raw,
     cudaError_t err;
     err = cudaMalloc(&d_het_buf, het_bytes);
     if (err != cudaSuccess) {
-        fprintf(stderr, "  [chroma] Failed to alloc het buffer (%zu MB): %s\n",
-                het_bytes / (1024*1024), cudaGetErrorString(err));
+        fprintf(stderr, "  [chroma] Failed to alloc het buffer: %s\n", cudaGetErrorString(err));
+        cudaFree(d_field_track); cudaFree(d_field_phase_offset);
         return;
     }
     err = cudaMalloc(&d_fft_buf, fft_bytes);
     if (err != cudaSuccess) {
-        fprintf(stderr, "  [chroma] Failed to alloc FFT buffer (%zu MB): %s\n",
-                fft_bytes / (1024*1024), cudaGetErrorString(err));
-        cudaFree(d_het_buf);
+        fprintf(stderr, "  [chroma] Failed to alloc FFT buffer: %s\n", cudaGetErrorString(err));
+        cudaFree(d_het_buf); cudaFree(d_field_track); cudaFree(d_field_phase_offset);
         return;
     }
 
-    // Create cuFFT plans for chunk_lines
+    // Create cuFFT plans
     cufftHandle plan_r2c = 0, plan_c2r = 0;
     int n[] = { fft_size };
 
-    cufftResult cufft_err;
-    cufft_err = cufftPlanMany(&plan_r2c, 1, n,
-        NULL, 1, fft_size,
-        NULL, 1, freq_bins,
-        CUFFT_D2Z, chunk_lines);
+    cufftPlanMany(&plan_r2c, 1, n, NULL, 1, fft_size, NULL, 1, freq_bins, CUFFT_D2Z, chunk_lines);
+    cufftPlanMany(&plan_c2r, 1, n, NULL, 1, freq_bins, NULL, 1, fft_size, CUFFT_Z2D, chunk_lines);
 
-    if (cufft_err != CUFFT_SUCCESS) {
-        fprintf(stderr, "  [chroma] cuFFT R2C plan failed: %d\n", cufft_err);
-        cudaFree(d_het_buf); cudaFree(d_fft_buf);
-        return;
-    }
-
-    cufft_err = cufftPlanMany(&plan_c2r, 1, n,
-        NULL, 1, freq_bins,
-        NULL, 1, fft_size,
-        CUFFT_Z2D, chunk_lines);
-
-    if (cufft_err != CUFFT_SUCCESS) {
-        fprintf(stderr, "  [chroma] cuFFT C2R plan failed: %d\n", cufft_err);
-        cufftDestroy(plan_r2c);
-        cudaFree(d_het_buf); cudaFree(d_fft_buf);
-        return;
-    }
-
-    double fft_scale = 1.0 / (double)fft_size;
     int fields_per_chunk = chunk_lines / output_field_lines;
 
-    // Process in chunks
     for (int field_start = 0; field_start < num_fields; field_start += fields_per_chunk) {
         int fields_this = std::min(fields_per_chunk, num_fields - field_start);
         int lines_this = fields_this * output_field_lines;
 
-        // If last chunk is smaller, we need new cuFFT plans
-        // (cuFFT batch size must match). Recreate only if needed.
         if (lines_this < chunk_lines) {
             cufftDestroy(plan_r2c);
             cufftDestroy(plan_c2r);
-
-            cufftPlanMany(&plan_r2c, 1, n,
-                NULL, 1, fft_size, NULL, 1, freq_bins,
-                CUFFT_D2Z, lines_this);
-            cufftPlanMany(&plan_c2r, 1, n,
-                NULL, 1, freq_bins, NULL, 1, fft_size,
-                CUFFT_Z2D, lines_this);
+            cufftPlanMany(&plan_r2c, 1, n, NULL, 1, fft_size, NULL, 1, freq_bins, CUFFT_D2Z, lines_this);
+            cufftPlanMany(&plan_c2r, 1, n, NULL, 1, freq_bins, NULL, 1, fft_size, CUFFT_Z2D, lines_this);
         }
 
-        // Phase 1: TBC resample raw + heterodyne
+        // Resample + heterodyne with correct per-field phases
         {
-            int total_samples = lines_this * fft_size;
+            int total = lines_this * fft_size;
             int threads = 256;
-            int blocks = (total_samples + threads - 1) / threads;
+            int blocks = (total + threads - 1) / threads;
             k_resample_raw_het<<<blocks, threads>>>(
                 d_raw, d_linelocs, d_het_buf,
                 lines_this, field_start, output_field_lines,
                 fmt.lines_per_frame, output_line_len, fft_size,
                 fmt.active_line_start, total_raw_samples, het_scale,
-                0);  // track phase guess (0 or 1) — TODO: auto-detect
+                d_field_track, d_field_phase_offset);
         }
 
-        // Phase 2: Forward FFT
         cufftExecD2Z(plan_r2c, d_het_buf, d_fft_buf);
 
-        // Phase 3: Bandpass at fsc
         {
             int total = lines_this * freq_bins;
             int threads = 256;
             int blocks = (total + threads - 1) / threads;
-            k_chroma_bandpass<<<blocks, threads>>>(
-                d_fft_buf, lines_this, freq_bins, fsc_bin, bandwidth_bins);
+            k_chroma_bandpass<<<blocks, threads>>>(d_fft_buf, lines_this, freq_bins, fsc_bin, bandwidth_bins);
         }
 
-        // Phase 4: Inverse FFT
         cufftExecZ2D(plan_c2r, d_fft_buf, d_het_buf);
 
-        // Phase 5: ACC + output
-        // Output pointer offset to the right position in d_tbc_chroma
         uint16_t* out_ptr = const_cast<uint16_t*>(
             d_tbc_chroma + (size_t)field_start * output_field_lines * output_line_len);
 
@@ -348,9 +604,10 @@ void chroma_decode(const double* d_raw,
             fmt.burst_abs_ref, fft_scale);
     }
 
-    // Cleanup
     cufftDestroy(plan_r2c);
     cufftDestroy(plan_c2r);
     cudaFree(d_het_buf);
     cudaFree(d_fft_buf);
+    cudaFree(d_field_track);
+    cudaFree(d_field_phase_offset);
 }

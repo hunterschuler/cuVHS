@@ -1116,3 +1116,107 @@ TBC output values across the entire image.
 
 - 5-minute clip sanity check (broader test across varied content)
 - Chroma quality improvements (burst deemphasis, comb filter, track auto-detection)
+
+---
+
+## K6 Chroma: Track Detection + Phase Cycling Diagnosis (2026-03-24)
+
+### Track Auto-Detection (Working)
+
+VHS records chroma with a per-track phase rotation: NTSC uses [-1, 1] rotation
+pattern, meaning even fields and odd fields have different heterodyne phase.
+Getting this wrong produces no chroma or inverted chroma.
+
+Implemented track auto-detection by trial:
+1. Process field 0 with track=0 and track=1 (full resample + het + FFT + bandpass + IFFT)
+2. Measure burst cancellation: sum of |burst_a + burst_b| for adjacent line pairs
+3. Correct track gives lower metric (NTSC burst alternates 180°/line → cancels)
+4. Typical metrics: ~700 (correct) vs ~4600 (wrong) — clear separation
+
+Track alternates per field: `field_track[f] = (f & 1) ? (1 - detected) : detected`
+
+### Continuous Heterodyne Phase (Fixed)
+
+The v0 chroma kernel computed the heterodyne carrier per-line as:
+```
+het = -cos(2π × het_freq/output_rate × col)
+```
+where `col` resets to 0 each line. This creates a 171.5° phase discontinuity at
+every line boundary because `output_line_len × het_freq/output_rate` is not an integer.
+
+Python generates the carrier continuously across the full field:
+```python
+t = np.arange(fieldlen)
+chroma_het_cos = np.cos(2π × chroma_het_freq × t / sample_rate)
+```
+
+Fixed by using absolute sample position within the field:
+```
+abs_sample = out_line * output_line_len + col
+het = -cos(2π × het_scale × abs_sample + phase_offset)
+```
+
+### Chroma Phase Cycling (Diagnosed, Not Yet Fixed)
+
+**Symptom:** On a 3-minute mid-tape clip, chroma exhibits a repeating cycle:
+color → tearing → grayscale → tearing → color. Period is roughly every ~80-100
+fields. The 10-second clip from tape start doesn't show this because it's too
+short to see the cycle.
+
+**Root Cause:** The raw RF signal fed to the heterodyne stage contains the full
+spectrum — including the luma FM carrier at 3.4–4.4 MHz. When heterodyned by
+(fsc + chroma_under) ≈ 4.2 MHz, the FM carrier lands right in the fsc band
+(3.58 MHz), contaminating the chroma output. This contamination creates a beat
+frequency that manifests as the cycling pattern.
+
+**What Python does differently:** Before heterodyning, Python applies a Butterworth
+bandpass filter on the raw RF signal at the *capture* sample rate (28 MHz):
+- `get_chroma_bandpass()` in `chromaAFC.py`: 4th-order Butterworth
+- Passband: 60 kHz to ~1.2 MHz (just the color-under band around 629 kHz)
+- This removes the FM luma carrier entirely before it can contaminate chroma
+
+The relevant Python call chain:
+```
+process.py: out_chroma = demod_chroma_filt(chroma_source, FVideoBurst, ...)
+chromaAFC.py: get_chroma_bandpass() → 60 kHz to chroma_bpf_upper (1.2 MHz)
+format_defs/vhs.py: chroma_bpf_upper = 1200000
+```
+
+**Fix Plan:** Add pre-bandpass filtering of raw RF around the color-under band
+(60 kHz to 1.2 MHz at capture rate) before TBC resampling and heterodyning.
+This requires an FFT at the capture-rate sample size (per-field, ~468k samples),
+not the short per-line FFT currently used. Options:
+- Reuse K1's cuFFT D2Z/Z2D plans with a new filter kernel
+- Add a separate bandpass FFT pass before the existing resample+het step
+
+### NTSC Phase Sequence (Implemented, Disabled)
+
+Code exists for NTSC 4-frame (8-field) phase rotation via burst phase quadrant
+measurement and lookup table (`ntsc_phase_table[]`). Currently disabled
+(`h_phase_offset[f] = 0` for all fields) because it cannot be validated until
+the pre-bandpass fix eliminates the contamination cycling.
+
+### Progress Bar Fix
+
+Added `fflush(stderr)` after all fprintf progress output in `pipeline.cu`.
+Without this, the progress bar and dashboard were only visible after decode
+completion because stderr was line-buffered when piped to a terminal emulator.
+
+### What Changed (files)
+
+- `src/pipeline/chroma_decode.cu`:
+  - Added per-field `field_track[]` and `field_phase_offset[]` GPU arrays
+  - Track auto-detection via `process_one_field_chroma()` + `measure_burst_cancellation()`
+  - Burst phase measurement via `measure_burst_phase()` (I/Q product detection)
+  - NTSC phase lookup table `ntsc_phase_table[]` + `lookup_ntsc_phase_offset()`
+  - Continuous heterodyne phase using absolute sample position
+  - Debug output to stderr (track metrics, burst phases)
+- `src/pipeline/pipeline.cu`:
+  - `fflush(stderr)` after progress display updates
+
+### Next Steps
+
+1. **Implement pre-bandpass filtering** of raw RF at capture rate (60 kHz – 1.2 MHz)
+2. Re-enable NTSC phase sequence after bandpass fix validates
+3. Clean up debug fprintf statements
+4. Test on full 5-minute clip
