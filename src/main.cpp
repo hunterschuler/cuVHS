@@ -10,11 +10,12 @@
 #include "pipeline/pipeline.h"
 
 struct Args {
-    std::string input_path;
+    std::string input_path;      // "-" or empty for stdin
     std::string output_base;     // output prefix (writes .tbc, _chroma.tbc, .tbc.json)
     VideoSystem system = VideoSystem::NTSC;
     double sample_rate_mhz = 28.0;
     InputFormat input_format = InputFormat::U8;
+    bool format_explicit = false; // true if user specified --format
     int gpu_id = 0;              // -1 = auto-select best GPU
     bool overwrite = false;
 };
@@ -26,7 +27,7 @@ static void print_usage(const char* prog) {
         "Usage: %s [options] <input_file> <output_base>\n"
         "\n"
         "Arguments:\n"
-        "  input_file       Raw RF capture (.u8, .s16, .u16, .raw)\n"
+        "  input_file       Raw RF capture (.u8, .s16, .u16, .raw), or - for stdin\n"
         "  output_base      Output prefix (creates .tbc, _chroma.tbc, .tbc.json)\n"
         "\n"
         "Options:\n"
@@ -54,6 +55,7 @@ static bool parse_args(int argc, char** argv, Args& args) {
             args.sample_rate_mhz = atof(argv[++i]);
         } else if (strcmp(argv[i], "--format") == 0 && i + 1 < argc) {
             i++;
+            args.format_explicit = true;
             if (strcmp(argv[i], "u8") == 0) args.input_format = InputFormat::U8;
             else if (strcmp(argv[i], "s16") == 0) args.input_format = InputFormat::S16;
             else { fprintf(stderr, "Unknown format: %s\n", argv[i]); return false; }
@@ -61,7 +63,7 @@ static bool parse_args(int argc, char** argv, Args& args) {
             args.gpu_id = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--overwrite") == 0) {
             args.overwrite = true;
-        } else if (argv[i][0] == '-') {
+        } else if (argv[i][0] == '-' && strlen(argv[i]) > 1) {
             fprintf(stderr, "Unknown option: %s\n", argv[i]);
             return false;
         } else {
@@ -92,8 +94,8 @@ int main(int argc, char** argv) {
     if (!parse_args(argc, argv, args))
         return 1;
 
-    // Auto-detect input format from extension if not specified
-    if (args.input_format == InputFormat::U8)
+    // Auto-detect input format from extension if not explicitly set
+    if (!args.format_explicit)
         args.input_format = detect_format(args.input_path);
 
     // GPU setup
@@ -108,17 +110,32 @@ int main(int argc, char** argv) {
     VideoFormat fmt(args.system, args.sample_rate_mhz);
     fmt.print_info();
 
-    // Open input
+    // Open input — stdin/pipe or file
     RawReader reader;
-    if (!reader.open(args.input_path, args.input_format)) {
-        fprintf(stderr, "Failed to open input: %s\n", args.input_path.c_str());
-        return 1;
+    bool is_stdin = (args.input_path == "-");
+    if (is_stdin) {
+        if (!reader.open_stdin(args.input_format)) {
+            fprintf(stderr, "Failed to open stdin\n");
+            return 1;
+        }
+        fprintf(stderr, "Input: stdin (%.1f MHz, %s, streaming)\n",
+                args.sample_rate_mhz, input_format_name(args.input_format));
+    } else {
+        if (!reader.open(args.input_path, args.input_format)) {
+            fprintf(stderr, "Failed to open input: %s\n", args.input_path.c_str());
+            return 1;
+        }
+        if (reader.is_stream()) {
+            fprintf(stderr, "Input: %s (%.1f MHz, %s, streaming FIFO)\n",
+                    args.input_path.c_str(), args.sample_rate_mhz,
+                    input_format_name(args.input_format));
+        } else {
+            fprintf(stderr, "Input: %s (%.1f MHz, %s, %.2f GB)\n",
+                    args.input_path.c_str(), args.sample_rate_mhz,
+                    input_format_name(args.input_format),
+                    reader.size_bytes() / (1024.0 * 1024.0 * 1024.0));
+        }
     }
-    fprintf(stderr, "Input: %s (%.1f MHz, %s, %.2f GB)\n",
-            args.input_path.c_str(),
-            args.sample_rate_mhz,
-            input_format_name(args.input_format),
-            reader.size_bytes() / (1024.0 * 1024.0 * 1024.0));
 
     // Open output
     TBCWriter writer;

@@ -50,6 +50,7 @@ private:
     bool allocate_buffers();
     void free_buffers();
 
-    // Process one batch of fields. Returns number of fields processed.
-    int process_batch(size_t sample_offset, int num_fields);
+    // Process one batch of fields. Reads sequentially from the reader.
+    // Returns number of fields processed (0 at EOF).
+    int process_batch(int num_fields);
 };

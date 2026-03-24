@@ -227,6 +227,73 @@ Results:
 - 54 FPS with stub kernels (just I/O overhead — real perf comes with kernel implementation)
 - All 7 kernel stubs executed in correct order
 
+---
+
+## Streaming / Real-Time Decode Support (2026-03-23)
+
+### Motivation
+
+The VHS preservation workflow currently requires:
+1. Capture raw RF to disk (can take hours for a full tape)
+2. Decode raw RF to TBC (another few hours)
+3. Export TBC to video (more time)
+
+With a GPU decoder fast enough to exceed real-time, steps 1 and 2 can be
+combined: pipe the capture device's output directly into cuVHS. This saves
+wall-clock time and lets the operator see decoded video during capture to
+catch tracking errors, tape damage, etc. immediately rather than discovering
+them hours later.
+
+### Implementation
+
+Reworked `RawReader` to support two modes:
+
+**File mode** (existing): Random-access reads via `pread()`. Total size known.
+Used for normal decode of captured files.
+
+**Stream mode** (new): Sequential blocking reads from stdin or a named pipe/FIFO.
+No seeking, total size unknown. Used for real-time decode during capture.
+
+Key changes:
+- `open_stream(fd)` / `open_stdin()` — new constructors for stream mode
+- `read_next()` — sequential read that works in both modes (replaces offset-based `read()`)
+- `read_full()` — internal helper that retries partial reads from pipes (a single
+  `read()` syscall on a pipe may return less than requested even when more data is
+  coming; this loops until the full amount is available or EOF)
+- `open()` auto-detects FIFOs via `S_ISFIFO` and switches to stream mode
+- `is_stream()` / `is_seekable()` queries for the pipeline to adapt behavior
+
+Pipeline changes:
+- Stream mode uses smaller batches (max 64 fields vs 512) for lower latency
+- Progress display shows field count without percentages (total unknown)
+- Main loop reads sequentially until EOF instead of computing offsets
+
+CLI: Use `-` as input_file to read from stdin. `--format` is required for stdin
+since there's no file extension to auto-detect from.
+
+### Testing
+
+**File mode** (unchanged behavior):
+```
+$ cuvhs -f 28 --system NTSC --overwrite TAPE_1_10s.u8 /tmp/test
+Batch size: 512 fields — 53.5 FPS
+```
+
+**Stream mode via pipe:**
+```
+$ cat TAPE_1_10s.u8 | cuvhs -f 28 --system NTSC --format u8 --overwrite - /tmp/test
+Input: stdin (28.0 MHz, u8, streaming)
+Batch size: 64 fields [stream mode]
+598 fields — 47.3 FPS (streaming)
+```
+
+Both produce identical output (598 fields, 273 MB TBC files).
+
+The intended real-time capture usage:
+```
+capture_device -r 28e6 | cuvhs -f 28 --system NTSC --format u8 - output
+```
+
 ### Next Steps
 
 Implement Kernel 1 (FM Demodulation) — the foundation kernel. Everything downstream

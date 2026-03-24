@@ -35,14 +35,17 @@ size_t Pipeline::bytes_per_field() const {
 bool Pipeline::allocate_buffers() {
     batch_size = gpu.max_batch_size(bytes_per_field(), 0.8);
 
-    // Clamp to reasonable range
-    if (batch_size < 1) batch_size = 1;
-    if (batch_size > 512) batch_size = 512;
+    // In stream mode, use smaller batches for lower latency
+    int max_batch = reader.is_stream() ? 64 : 512;
 
-    fprintf(stderr, "Batch size: %d fields (%.1f MB per field, %.1f MB total)\n",
+    if (batch_size < 1) batch_size = 1;
+    if (batch_size > max_batch) batch_size = max_batch;
+
+    fprintf(stderr, "Batch size: %d fields (%.1f MB per field, %.1f MB total)%s\n",
             batch_size,
             bytes_per_field() / (1024.0 * 1024.0),
-            batch_size * bytes_per_field() / (1024.0 * 1024.0));
+            batch_size * bytes_per_field() / (1024.0 * 1024.0),
+            reader.is_stream() ? " [stream mode]" : "");
 
     size_t n = batch_size;
     size_t spf = fmt.samples_per_field;
@@ -81,67 +84,68 @@ void Pipeline::free_buffers() {
     safe_free(&d_tbc_chroma);
 }
 
-int Pipeline::process_batch(size_t sample_offset, int num_fields) {
-    // TODO: implement each kernel stage
-    // For now, this is the skeleton showing the execution order.
-
+int Pipeline::process_batch(int num_fields) {
     size_t spf = fmt.samples_per_field;
     size_t tbc_field_size = fmt.output_line_len * fmt.output_field_lines;
 
-    // 1. Upload raw data to GPU
-    // (In production: read raw from disk → pinned host buffer → async copy)
-    // For now, read into host buffer, convert, upload
+    // 1. Read raw data into host buffer
+    // read_next works for both file mode (sequential) and stream mode (blocking)
     auto* h_raw = new double[num_fields * spf];
-    size_t samples_read = reader.read(h_raw, sample_offset, num_fields * spf);
+    size_t samples_read = reader.read_next(h_raw, num_fields * spf);
     if (samples_read == 0) {
         delete[] h_raw;
         return 0;
     }
     int fields_loaded = static_cast<int>(samples_read / spf);
+    if (fields_loaded == 0) {
+        delete[] h_raw;
+        return 0;
+    }
 
+    // 2. Upload to GPU
     cudaMemcpy(d_raw, h_raw, fields_loaded * spf * sizeof(double),
                cudaMemcpyHostToDevice);
     delete[] h_raw;
 
-    // 2. FM Demodulation (Kernel 1)
+    // 3. FM Demodulation (Kernel 1)
     fm_demod(static_cast<double*>(d_raw),
              static_cast<double*>(d_demod),
              static_cast<double*>(d_demod_05),
              fields_loaded, spf, fmt);
 
-    // 3. Find Sync Pulses (Kernel 2)
+    // 4. Find Sync Pulses (Kernel 2)
     sync_pulses(static_cast<double*>(d_demod_05),
                 static_cast<int*>(d_pulses),
                 fields_loaded, spf, fmt);
 
-    // 4. Classify Pulses + Line Locations (Kernel 3)
+    // 5. Classify Pulses + Line Locations (Kernel 3)
     line_locs(static_cast<int*>(d_pulses),
               static_cast<double*>(d_linelocs),
               fields_loaded, fmt);
 
-    // 5. Refine Line Locations via Hsync Correlation (Kernel 4)
+    // 6. Refine Line Locations via Hsync Correlation (Kernel 4)
     hsync_refine(static_cast<double*>(d_demod_05),
                  static_cast<double*>(d_linelocs),
                  fields_loaded, fmt);
 
-    // 6. TBC Resample (Kernel 5)
+    // 7. TBC Resample (Kernel 5)
     tbc_resample(static_cast<double*>(d_demod),
                  static_cast<double*>(d_linelocs),
                  static_cast<uint16_t*>(d_tbc_luma),
                  fields_loaded, fmt);
 
-    // 7. Chroma Decode (Kernel 6)
+    // 8. Chroma Decode (Kernel 6)
     chroma_decode(static_cast<double*>(d_raw),
                   static_cast<double*>(d_linelocs),
                   static_cast<uint16_t*>(d_tbc_chroma),
                   fields_loaded, fmt);
 
-    // 8. Dropout Detection (Kernel 7)
+    // 9. Dropout Detection (Kernel 7)
     dropout_detect(static_cast<double*>(d_demod),
                    static_cast<uint16_t*>(d_tbc_luma),
                    fields_loaded, spf, fmt);
 
-    // 9. Download TBC results and write to disk
+    // 10. Download TBC results and write to disk
     auto* h_luma = new uint16_t[fields_loaded * tbc_field_size];
     auto* h_chroma = new uint16_t[fields_loaded * tbc_field_size];
 
@@ -169,36 +173,51 @@ bool Pipeline::run() {
     if (!allocate_buffers())
         return false;
 
-    size_t total_samples = reader.total_samples();
+    size_t total_samples = reader.total_samples();  // 0 for streams
     size_t spf = fmt.samples_per_field;
-    int total_fields_est = static_cast<int>(total_samples / spf);
+    bool streaming = reader.is_stream();
 
-    fprintf(stderr, "Starting decode: ~%d fields in batches of %d\n",
-            total_fields_est, batch_size);
+    if (streaming) {
+        fprintf(stderr, "Starting decode: streaming mode, batches of %d fields\n", batch_size);
+    } else {
+        int total_fields_est = static_cast<int>(total_samples / spf);
+        fprintf(stderr, "Starting decode: ~%d fields in batches of %d\n",
+                total_fields_est, batch_size);
+    }
 
     auto t_start = std::chrono::steady_clock::now();
-    size_t sample_offset = 0;
     int total_fields = 0;
 
-    while (sample_offset < total_samples) {
-        int fields_this_batch = std::min(batch_size,
-            static_cast<int>((total_samples - sample_offset) / spf));
-        if (fields_this_batch <= 0) break;
+    while (true) {
+        int fields_this_batch = batch_size;
 
-        int processed = process_batch(sample_offset, fields_this_batch);
-        if (processed == 0) break;
+        // In file mode, don't request more fields than remain
+        if (!streaming) {
+            size_t consumed = static_cast<size_t>(total_fields) * spf;
+            if (consumed >= total_samples) break;
+            size_t remaining_fields = (total_samples - consumed) / spf;
+            if (remaining_fields == 0) break;
+            fields_this_batch = std::min(batch_size, static_cast<int>(remaining_fields));
+        }
+
+        int processed = process_batch(fields_this_batch);
+        if (processed == 0) break;  // EOF or error
 
         total_fields += processed;
-        sample_offset += processed * spf;
 
         // Progress
         auto now = std::chrono::steady_clock::now();
         double elapsed = std::chrono::duration<double>(now - t_start).count();
         double fps = (total_fields / 2.0) / elapsed;
-        double pct = 100.0 * sample_offset / total_samples;
 
-        fprintf(stderr, "\r  %d fields (%.1f%%) — %.1f FPS",
-                total_fields, pct, fps);
+        if (streaming) {
+            fprintf(stderr, "\r  %d fields — %.1f FPS (streaming)",
+                    total_fields, fps);
+        } else {
+            double pct = 100.0 * total_fields * spf / total_samples;
+            fprintf(stderr, "\r  %d fields (%.1f%%) — %.1f FPS",
+                    total_fields, pct, fps);
+        }
     }
 
     auto t_end = std::chrono::steady_clock::now();
