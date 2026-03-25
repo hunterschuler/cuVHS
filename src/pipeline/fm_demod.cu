@@ -297,13 +297,14 @@ size_t FMDemodState::scratch_bytes_per_field(int samples_per_field) {
 // ============================================================
 // Init
 // ============================================================
-bool FMDemodState::init(const VideoFormat& fmt, int max_batch_size) {
+bool FMDemodState::init(const VideoFormat& fmt, int max_batch_size, int samples_per_field_override) {
     max_batch = max_batch_size;
-    fft_size  = next_fft_size(fmt.samples_per_field);
+    int spf = (samples_per_field_override > 0) ? samples_per_field_override : fmt.samples_per_field;
+    fft_size  = next_fft_size(spf);
     freq_bins = fft_size / 2 + 1;
 
     fprintf(stderr, "  [FM demod] FFT size: %d (field: %d, pad: +%d)  freq bins: %d  batch: %d\n",
-            fft_size, fmt.samples_per_field, fft_size - fmt.samples_per_field, freq_bins, max_batch);
+            fft_size, spf, fft_size - spf, freq_bins, max_batch);
 
     double fs      = fmt.sample_rate;
     double nyquist = fs / 2.0;

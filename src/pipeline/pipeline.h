@@ -52,6 +52,7 @@ private:
     void* d_pulse_starts = nullptr;  // pulse start positions (batch x MAX_PULSES ints)
     void* d_pulse_lengths = nullptr; // pulse lengths (batch x MAX_PULSES ints)
     void* d_pulse_count = nullptr;   // pulse count per field (batch ints)
+    void* d_pulse_types = nullptr;   // pulse type classification (batch x MAX_PULSES ints)
     void* d_linelocs = nullptr;    // line locations (batch)
     void* d_tbc_luma = nullptr;    // TBC luma output (uint16, batch)
     void* d_tbc_chroma = nullptr;  // TBC chroma output (uint16, batch)

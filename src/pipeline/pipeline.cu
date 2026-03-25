@@ -8,6 +8,7 @@
 #include "pipeline/dropout_detect.h"
 
 #include <cuda_runtime.h>
+#include <cufft.h>
 #include <cstdio>
 #include <cstring>
 #include <chrono>
@@ -54,29 +55,52 @@ Pipeline::~Pipeline() {
     free_buffers();
 }
 
-// Extra samples to read beyond samples_per_field so that the TBC resampler
+// Extra lines to read/demod beyond samples_per_field so that the TBC resampler
 // has valid demod data for the last output lines.  With ref_line=19 and
 // active_line_start=10, the last output line (linelocs[272]) needs data
-// ~16K samples past the nominal field boundary.
-static const int FIELD_MARGIN_LINES = 12;
+// ~16K samples past the nominal field boundary.  NTSC vblank = 9H, so
+// 20 lines (35.6K samples) covers this with margin.
+static const int FIELD_MARGIN_LINES = 20;
 
 size_t Pipeline::bytes_per_field() const {
-    size_t raw = fmt.samples_per_field * sizeof(double);       // input (converted)
-    // +1 field margin in d_demod is amortized across batch (see allocate_buffers)
-    size_t demod = fmt.samples_per_field * sizeof(double);     // demod output (per field)
-    size_t demod_05 = fmt.samples_per_field * sizeof(double);  // sync demod
-    size_t pulses = MAX_PULSES * 2 * sizeof(int) + sizeof(int); // starts + lengths + count
+    size_t spf_padded = fmt.samples_per_field + FIELD_MARGIN_LINES * fmt.samples_per_line;
+    size_t raw = spf_padded * sizeof(double);                  // input (converted, padded)
+    size_t demod = spf_padded * sizeof(double);                // demod output (padded)
+    size_t demod_05 = spf_padded * sizeof(double);             // sync demod (padded)
+    size_t pulses = MAX_PULSES * 3 * sizeof(int) + sizeof(int); // starts + lengths + types + count
     size_t linelocs = fmt.lines_per_frame * sizeof(double);    // line locations
     size_t tbc = fmt.output_line_len * fmt.output_field_lines * sizeof(uint16_t);  // luma
     size_t chroma = tbc;                                       // chroma
 
     // K1 (FM demod) scratch buffers: FFT half, analytic, post-FFT
-    size_t k1_scratch = FMDemodState::scratch_bytes_per_field(fmt.samples_per_field);
+    size_t k1_scratch = FMDemodState::scratch_bytes_per_field((int)spf_padded);
 
     // K7 (dropout detection) output buffers
     size_t dropouts = MAX_DROPOUTS_PER_FIELD * 3 * sizeof(int) + sizeof(int);  // lines + starts + ends + count
 
-    return raw + demod + demod_05 + pulses + linelocs + tbc + chroma + k1_scratch + dropouts;
+    // cuFFT internal workspace (estimated per field, scales linearly with batch)
+    int fft_size = (int)spf_padded;
+    // Round up to 7-smooth for cuFFT (same logic as fm_demod.cu)
+    while (true) {
+        int n = fft_size;
+        while (n % 2 == 0) n /= 2;
+        while (n % 3 == 0) n /= 3;
+        while (n % 5 == 0) n /= 5;
+        while (n % 7 == 0) n /= 7;
+        if (n == 1) break;
+        fft_size++;
+    }
+    int freq_bins = fft_size / 2 + 1;
+    size_t ws_r2c = 0, ws_c2c = 0, ws_c2r = 0;
+    {
+        int n[] = { fft_size };
+        cufftEstimateMany(1, n, NULL, 1, fft_size, NULL, 1, freq_bins, CUFFT_D2Z, 1, &ws_r2c);
+        cufftEstimateMany(1, n, NULL, 1, fft_size, NULL, 1, fft_size, CUFFT_Z2Z, 1, &ws_c2c);
+        cufftEstimateMany(1, n, NULL, 1, freq_bins, NULL, 1, fft_size, CUFFT_Z2D, 1, &ws_c2r);
+    }
+    size_t cufft_workspace = ws_r2c + ws_c2c + ws_c2r;
+
+    return raw + demod + demod_05 + pulses + linelocs + tbc + chroma + k1_scratch + dropouts + cufft_workspace;
 }
 
 bool Pipeline::allocate_buffers() {
@@ -96,7 +120,14 @@ bool Pipeline::allocate_buffers() {
 
     size_t n = batch_size;
     size_t spf = fmt.samples_per_field;
+    size_t spf_padded = spf + FIELD_MARGIN_LINES * fmt.samples_per_line;
     size_t tbc_field_size = fmt.output_line_len * fmt.output_field_lines;
+
+    fprintf(stderr, "  Field margin: %d lines (%zu extra samples, spf_padded=%zu)\n",
+            FIELD_MARGIN_LINES, spf_padded - spf, spf_padded);
+
+    size_t vram_free_before, vram_total;
+    cudaMemGetInfo(&vram_free_before, &vram_total);
 
     auto alloc = [](void** ptr, size_t bytes) -> bool {
         cudaError_t err = cudaMalloc(ptr, bytes);
@@ -107,14 +138,15 @@ bool Pipeline::allocate_buffers() {
         return true;
     };
 
-    // Demod buffer gets +1 field margin so the last field's TBC resampler
-    // doesn't read past the end (linelocs for bottom lines overshoot spf).
-    if (!alloc(&d_raw,        n * spf * sizeof(double)))    return false;
-    if (!alloc(&d_demod,      (n + 1) * spf * sizeof(double)))    return false;
-    if (!alloc(&d_demod_05,   n * spf * sizeof(double)))    return false;
+    // All raw/demod buffers use spf_padded stride so each field's demod data
+    // includes continuation samples past the nominal boundary (for TBC resampler).
+    if (!alloc(&d_raw,        n * spf_padded * sizeof(double)))    return false;
+    if (!alloc(&d_demod,      n * spf_padded * sizeof(double)))    return false;
+    if (!alloc(&d_demod_05,   n * spf_padded * sizeof(double)))    return false;
     if (!alloc(&d_pulse_starts,  n * MAX_PULSES * sizeof(int)))  return false;
     if (!alloc(&d_pulse_lengths, n * MAX_PULSES * sizeof(int)))  return false;
     if (!alloc(&d_pulse_count,   n * sizeof(int)))               return false;
+    if (!alloc(&d_pulse_types,   n * MAX_PULSES * sizeof(int)))  return false;
     if (!alloc(&d_linelocs,   n * fmt.lines_per_frame * sizeof(double))) return false;
     if (!alloc(&d_tbc_luma,   n * tbc_field_size * sizeof(uint16_t)))    return false;
     if (!alloc(&d_tbc_chroma, n * tbc_field_size * sizeof(uint16_t)))    return false;
@@ -124,10 +156,16 @@ bool Pipeline::allocate_buffers() {
     if (!alloc(&d_do_count,  n * sizeof(int)))                          return false;
 
     // Initialize FM demod state (cuFFT plans + filter arrays + scratch buffers)
-    if (!demod_state.init(fmt, batch_size)) {
+    // Use spf_padded so FFT plans are sized for the larger field
+    if (!demod_state.init(fmt, batch_size, (int)spf_padded)) {
         fprintf(stderr, "Failed to initialize FM demod\n");
         return false;
     }
+
+    size_t vram_free_after, vram_dummy;
+    cudaMemGetInfo(&vram_free_after, &vram_dummy);
+    fprintf(stderr, "  VRAM used: %.1f GB, remaining: %.1f GB\n",
+            (vram_free_before - vram_free_after) / 1e9, vram_free_after / 1e9);
 
     return true;
 }
@@ -142,6 +180,7 @@ void Pipeline::free_buffers() {
     safe_free(&d_pulse_starts);
     safe_free(&d_pulse_lengths);
     safe_free(&d_pulse_count);
+    safe_free(&d_pulse_types);
     safe_free(&d_linelocs);
     safe_free(&d_tbc_luma);
     safe_free(&d_tbc_chroma);
@@ -308,10 +347,11 @@ bool Pipeline::prescan_field_boundaries() {
 
 int Pipeline::process_batch(int start_field, int num_fields) {
     size_t spf = fmt.samples_per_field;
+    size_t spf_padded = spf + FIELD_MARGIN_LINES * fmt.samples_per_line;
     size_t tbc_field_size = fmt.output_line_len * fmt.output_field_lines;
 
-    // Read each field from its pre-scanned offset
-    auto* h_raw = new double[num_fields * spf];
+    // Read each field from its pre-scanned offset (spf_padded samples each)
+    auto* h_raw = new double[num_fields * spf_padded];
     int fields_loaded = 0;
 
     for (int i = 0; i < num_fields; i++) {
@@ -319,11 +359,11 @@ int Pipeline::process_batch(int start_field, int num_fields) {
         if (fi >= (int)field_offsets.size()) break;
 
         size_t offset = field_offsets[fi];
-        size_t n_read = reader.read_at(h_raw + (size_t)i * spf, offset, spf);
+        size_t n_read = reader.read_at(h_raw + (size_t)i * spf_padded, offset, spf_padded);
         if (n_read < spf / 2) break;
         // Zero-pad if short
-        if (n_read < spf) {
-            memset(h_raw + (size_t)i * spf + n_read, 0, (spf - n_read) * sizeof(double));
+        if (n_read < spf_padded) {
+            memset(h_raw + (size_t)i * spf_padded + n_read, 0, (spf_padded - n_read) * sizeof(double));
         }
         fields_loaded++;
     }
@@ -334,7 +374,7 @@ int Pipeline::process_batch(int start_field, int num_fields) {
     }
 
     // 2. Upload to GPU
-    cudaMemcpy(d_raw, h_raw, fields_loaded * spf * sizeof(double),
+    cudaMemcpy(d_raw, h_raw, fields_loaded * spf_padded * sizeof(double),
                cudaMemcpyHostToDevice);
     delete[] h_raw;
 
@@ -346,25 +386,20 @@ int Pipeline::process_batch(int start_field, int num_fields) {
             if (local_idx >= 0 && local_idx < fields_loaded) {
                 char path[256];
                 snprintf(path, sizeof(path), "/tmp/cuvhs_raw_field%d.bin", df);
-                size_t dump_n = std::min((size_t)DUMP_SAMPLES, spf);
+                size_t dump_n = std::min((size_t)DUMP_SAMPLES, spf_padded);
                 dump_gpu_doubles(path,
-                    static_cast<double*>(d_raw) + (size_t)local_idx * spf,
+                    static_cast<double*>(d_raw) + (size_t)local_idx * spf_padded,
                     dump_n);
             }
         }
     }
 
-    // Zero the margin field in d_demod so the TBC resampler's bounds check
-    // reads zeros (→ output_zero) instead of uninitialized memory for the
-    // last field's bottom lines that overshoot spf.
-    cudaMemset(static_cast<double*>(d_demod) + fields_loaded * spf, 0, spf * sizeof(double));
-
-    // 3. FM Demodulation (Kernel 1)
+    // 3. FM Demodulation (Kernel 1) — demod spf_padded samples per field
     fm_demod(demod_state,
              static_cast<double*>(d_raw),
              static_cast<double*>(d_demod),
              static_cast<double*>(d_demod_05),
-             fields_loaded, spf, fmt);
+             fields_loaded, spf_padded, fmt);
 
     // --- Debug: dump post-K1 demod_05 for target fields ---
     {
@@ -374,25 +409,40 @@ int Pipeline::process_batch(int start_field, int num_fields) {
             if (local_idx >= 0 && local_idx < fields_loaded) {
                 char path[256];
                 snprintf(path, sizeof(path), "/tmp/cuvhs_demod05_field%d.bin", df);
-                size_t dump_n = std::min((size_t)DUMP_SAMPLES, spf);
+                size_t dump_n = std::min((size_t)DUMP_SAMPLES, spf_padded);
                 dump_gpu_doubles(path,
-                    static_cast<double*>(d_demod_05) + (size_t)local_idx * spf,
+                    static_cast<double*>(d_demod_05) + (size_t)local_idx * spf_padded,
                     dump_n);
             }
         }
     }
 
-    // 4. Find Sync Pulses (Kernel 2)
+    // 4. Find Sync Pulses (Kernel 2) — uses spf_padded stride for buffer addressing
     sync_pulses(static_cast<double*>(d_demod_05),
                 static_cast<int*>(d_pulse_starts),
                 static_cast<int*>(d_pulse_lengths),
                 static_cast<int*>(d_pulse_count),
-                fields_loaded, spf, fmt);
+                fields_loaded, spf_padded, fmt);
+
+    // --- Debug: dump pulse counts ---
+    {
+        auto* h_pc = new int[fields_loaded];
+        cudaMemcpy(h_pc, d_pulse_count, fields_loaded * sizeof(int), cudaMemcpyDeviceToHost);
+        static auto dump_fields = get_dump_fields();
+        for (int df : dump_fields) {
+            int local_idx = df - start_field;
+            if (local_idx >= 0 && local_idx < fields_loaded) {
+                fprintf(stderr, "  [debug] field %d: %d pulses\n", df, h_pc[local_idx]);
+            }
+        }
+        delete[] h_pc;
+    }
 
     // 5. Classify Pulses + Line Locations (Kernel 3)
     line_locs(static_cast<int*>(d_pulse_starts),
               static_cast<int*>(d_pulse_lengths),
               static_cast<int*>(d_pulse_count),
+              static_cast<int*>(d_pulse_types),
               static_cast<double*>(d_linelocs),
               fields_loaded, fmt);
 
@@ -400,14 +450,31 @@ int Pipeline::process_batch(int start_field, int num_fields) {
     hsync_refine(static_cast<double*>(d_demod_05),
                  static_cast<double*>(d_linelocs),
                  fields_loaded,
-                 fields_loaded * (int)spf,
+                 fields_loaded * (int)spf_padded,
                  fmt);
 
-    // 7. TBC Resample (Kernel 5)
+    // --- Debug: dump linelocs for target fields ---
+    {
+        static auto dump_fields = get_dump_fields();
+        for (int df : dump_fields) {
+            int local_idx = df - start_field;
+            if (local_idx >= 0 && local_idx < fields_loaded) {
+                char path[256];
+                snprintf(path, sizeof(path), "/tmp/cuvhs_linelocs_field%d.bin", df);
+                dump_gpu_doubles(path,
+                    static_cast<double*>(d_linelocs) + (size_t)local_idx * fmt.lines_per_frame,
+                    fmt.lines_per_frame);
+            }
+        }
+    }
+
+    // 7. TBC Resample (Kernel 5) — total_demod_samples = fields * spf_padded
     tbc_resample(static_cast<double*>(d_demod),
                  static_cast<double*>(d_linelocs),
                  static_cast<uint16_t*>(d_tbc_luma),
-                 fields_loaded, fmt);
+                 fields_loaded,
+                 fields_loaded * (int)spf_padded,
+                 fmt);
 
     // 8. Chroma Decode (Kernel 6)
     // d_demod is reused as scratch — K5 (luma resample) is done with it
@@ -417,7 +484,7 @@ int Pipeline::process_batch(int start_field, int num_fields) {
                   static_cast<double*>(d_demod),
                   static_cast<uint16_t*>(d_tbc_chroma),
                   fields_loaded,
-                  fields_loaded * (int)spf,
+                  fields_loaded * (int)spf_padded,
                   fmt,
                   field_phase_ids);
 
@@ -430,7 +497,7 @@ int Pipeline::process_batch(int start_field, int num_fields) {
                    static_cast<int*>(d_do_starts),
                    static_cast<int*>(d_do_ends),
                    static_cast<int*>(d_do_count),
-                   fields_loaded, spf, fmt);
+                   fields_loaded, spf_padded, fmt);
 
     // 10. Download TBC results + dropout metadata and write to disk
     auto* h_luma = new uint16_t[fields_loaded * tbc_field_size];

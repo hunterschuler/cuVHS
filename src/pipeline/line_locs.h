@@ -28,6 +28,7 @@ enum PulseType : int { PULSE_HSYNC = 0, PULSE_EQ1 = 1, PULSE_VSYNC = 2, PULSE_EQ
 void line_locs(const int* d_pulse_starts,
                const int* d_pulse_lengths,
                const int* d_pulse_count,
+               int* d_pulse_types,
                double* d_linelocs,
                int num_fields,
                const VideoFormat& fmt);

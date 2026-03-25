@@ -302,14 +302,11 @@ __global__ void k_compute_linelocs(
 void line_locs(const int* d_pulse_starts,
                const int* d_pulse_lengths,
                const int* d_pulse_count,
+               int* d_pulse_types,
                double* d_linelocs,
                int num_fields,
                const VideoFormat& fmt)
 {
-    // Allocate temporary pulse type classification buffer
-    int* d_pulse_types = nullptr;
-    cudaMalloc(&d_pulse_types, (size_t)num_fields * MAX_PULSES * sizeof(int));
-
     // Compute classification thresholds (in samples)
     // Tolerance: ±0.5 µs for HSYNC and EQ, wider range for VSYNC
     double tol_samples = 0.5e-6 * fmt.sample_rate;
@@ -345,6 +342,4 @@ void line_locs(const int* d_pulse_starts,
             fmt.lines_per_frame, fmt.samples_per_line,
             hsync_min, hsync_max);
     }
-
-    cudaFree(d_pulse_types);
 }

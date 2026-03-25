@@ -17,4 +17,5 @@ void tbc_resample(const double* d_demod,
                   const double* d_linelocs,
                   uint16_t* d_tbc_luma,
                   int num_fields,
+                  int total_demod_samples,
                   const VideoFormat& fmt);

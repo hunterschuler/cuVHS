@@ -27,7 +27,7 @@ struct FMDemodState {
 
     int f05_offset = 32;            // sync FIR group delay (samples)
 
-    bool init(const VideoFormat& fmt, int max_batch_size);
+    bool init(const VideoFormat& fmt, int max_batch_size, int samples_per_field_override = 0);
     void destroy();
     ~FMDemodState() { destroy(); }
 

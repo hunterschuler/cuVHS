@@ -106,13 +106,11 @@ void tbc_resample(const double* d_demod,
                   const double* d_linelocs,
                   uint16_t* d_tbc_luma,
                   int num_fields,
+                  int total_demod_samples,
                   const VideoFormat& fmt)
 {
     int pixels_per_field = fmt.output_field_lines * fmt.output_line_len;
     int total_pixels = num_fields * pixels_per_field;
-    // d_demod is allocated with +1 field of margin so the last field's
-    // bottom lines (which overshoot spf due to vblank offset) have valid data.
-    int total_demod_samples = (num_fields + 1) * fmt.samples_per_field;
 
     int threads = 256;
     int blocks = (total_pixels + threads - 1) / threads;
