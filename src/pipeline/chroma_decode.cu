@@ -441,7 +441,8 @@ void chroma_decode(const double* d_raw,
                    int num_fields,
                    int total_raw_samples,
                    const VideoFormat& fmt,
-                   std::vector<int>& field_phase_ids)
+                   std::vector<int>& field_phase_ids,
+                   ChromaState* state)
 {
     int output_field_lines = fmt.output_field_lines;
     int output_line_len = fmt.output_line_len;
@@ -475,7 +476,10 @@ void chroma_decode(const double* d_raw,
     // in the chunk processing loop to avoid a huge temp buffer.
     // ---------------------------------------------------------------
 
-    int raw_fft_size = next_fft_size(fmt.samples_per_field);
+    // Per-field stride in the raw/scratch buffers (may be padded beyond nominal spf)
+    int field_stride = total_raw_samples / num_fields;
+
+    int raw_fft_size = next_fft_size(field_stride);
     int raw_freq_bins = raw_fft_size / 2 + 1;
 
     double chroma_bpf_lower = 60000.0;    // 60 kHz
@@ -511,11 +515,11 @@ void chroma_decode(const double* d_raw,
         cufftPlan1d(&bpf_plan_inv, raw_fft_size, CUFFT_Z2D, 1);
 
         for (int f = 0; f < num_fields; f++) {
-            size_t field_offset = (size_t)f * fmt.samples_per_field;
+            size_t field_offset = (size_t)f * field_stride;
 
             cudaMemset(d_bpf_padded, 0, raw_fft_size * sizeof(double));
             cudaMemcpy(d_bpf_padded, d_raw + field_offset,
-                       fmt.samples_per_field * sizeof(double),
+                       field_stride * sizeof(double),
                        cudaMemcpyDeviceToDevice);
 
             cufftExecD2Z(bpf_plan_fwd, d_bpf_padded, d_bpf_fft);
@@ -529,7 +533,7 @@ void chroma_decode(const double* d_raw,
             cufftExecZ2D(bpf_plan_inv, d_bpf_fft, d_bpf_padded);
 
             cudaMemcpy(d_scratch + field_offset, d_bpf_padded,
-                       fmt.samples_per_field * sizeof(double),
+                       field_stride * sizeof(double),
                        cudaMemcpyDeviceToDevice);
         }
 
@@ -553,11 +557,11 @@ void chroma_decode(const double* d_raw,
     cudaMalloc(&d_field_phase_offset, num_fields * sizeof(int));
 
     // ---------------------------------------------------------------
-    // Step 1: Track auto-detection on first field
+    // Step 1: Track detection
     //
-    // Process field 0 with both track=0 and track=1.
-    // Measure burst cancellation between adjacent lines.
-    // The correct track gives lower metric (bursts cancel in NTSC).
+    // If we have state from a previous batch, use it directly.
+    // Otherwise, process field 0 with both track=0 and track=1,
+    // measure burst cancellation, and pick the lower metric.
     // ---------------------------------------------------------------
 
     // Temp buffers for single-field processing
@@ -571,90 +575,99 @@ void chroma_decode(const double* d_raw,
 
     auto* h_det = new double[(size_t)output_field_lines * fft_size];
 
-    double metric[2];
-    for (int try_track = 0; try_track < 2; try_track++) {
+    int detected_track;
+    double good_metric_threshold;
+    int cycle_start;
+
+    // NTSC 4-frame phase ID cycle (8 fields):
+    static const int ntsc_phase_id_cycle[8] = { 3, 2, 1, 4, 3, 2, 1, 4 };
+
+    if (state && state->valid) {
+        // ---------------------------------------------------------------
+        // Continuation from previous batch — use carried state
+        // ---------------------------------------------------------------
+        detected_track = state->current_track;
+        good_metric_threshold = state->good_metric_threshold;
+        cycle_start = state->cycle_start;
+
+        fprintf(stderr, "  [chroma] Using carried state: track=%d threshold=%.4f cycle_start=%d\n",
+                detected_track, good_metric_threshold, cycle_start);
+    } else {
+        // ---------------------------------------------------------------
+        // First batch — full auto-detection
+        // ---------------------------------------------------------------
+        double metric[2];
+        for (int try_track = 0; try_track < 2; try_track++) {
+            process_one_field_chroma(
+                chroma_raw, d_linelocs, d_det_het, d_det_fft, h_det,
+                0, try_track, 0,
+                output_field_lines, fmt.lines_per_frame, output_line_len,
+                fft_size, freq_bins, fmt.active_line_start, total_raw_samples,
+                het_scale, fsc_bin, bandwidth_bins,
+                d_field_track, d_field_phase_offset);
+
+            metric[try_track] = measure_burst_cancellation(
+                h_det, output_field_lines, fft_size, output_line_len,
+                burst_start, burst_end, fft_scale);
+        }
+
+        detected_track = (metric[1] < metric[0]) ? 1 : 0;
+        good_metric_threshold = metric[detected_track] * 4.0;
+
+        fprintf(stderr, "  [chroma] Track detect: metric[0]=%.4f metric[1]=%.4f → track=%d\n",
+                metric[0], metric[1], detected_track);
+
+        // ---------------------------------------------------------------
+        // Step 2: NTSC burst phase measurement + 4-frame sequence lookup
+        // ---------------------------------------------------------------
+
+        // Re-process field 0 with correct track to get clean burst for phase measurement
         process_one_field_chroma(
             chroma_raw, d_linelocs, d_det_het, d_det_fft, h_det,
-            0, try_track, 0,
+            0, detected_track, 0,
             output_field_lines, fmt.lines_per_frame, output_line_len,
             fft_size, freq_bins, fmt.active_line_start, total_raw_samples,
             het_scale, fsc_bin, bandwidth_bins,
             d_field_track, d_field_phase_offset);
 
-        metric[try_track] = measure_burst_cancellation(
+        double burst_phase_0 = measure_burst_phase(
             h_det, output_field_lines, fft_size, output_line_len,
-            burst_start, burst_end, fft_scale);
+            burst_start, burst_end, fft_scale, fmt.fsc, fmt.output_rate);
+
+        int quadrant_0 = ((int)(burst_phase_0 / 90.0 + 0.5)) % 4;
+
+        // Field 0 is assumed first field; no previous burst → delta = -1
+        auto phase_result_0 = lookup_ntsc_phase(1, quadrant_0, -1);
+        int phase_id_0 = phase_result_0.phase_id;
+
+        fprintf(stderr, "  [chroma] Field 0: burst_phase=%.1f° quadrant=%d phase_id=%d\n",
+                burst_phase_0, quadrant_0, phase_id_0);
+
+        // Find where phase_id_0 appears for a first field in the cycle
+        cycle_start = 0;
+        for (int i = 0; i < 8; i += 2) {
+            if (ntsc_phase_id_cycle[i] == phase_id_0) {
+                cycle_start = i;
+                break;
+            }
+        }
     }
-
-    int detected_track = (metric[1] < metric[0]) ? 1 : 0;
-
-    fprintf(stderr, "  [chroma] Track detect: metric[0]=%.4f metric[1]=%.4f → track=%d\n",
-            metric[0], metric[1], detected_track);
-
-    // ---------------------------------------------------------------
-    // Step 2: NTSC burst phase measurement + 4-frame sequence lookup
-    //
-    // Using the detected track, measure burst phase from field 0.
-    // Look up the NTSC phase rotation offset.
-    // ---------------------------------------------------------------
-
-    // Re-process field 0 with correct track to get clean burst for phase measurement
-    process_one_field_chroma(
-        chroma_raw, d_linelocs, d_det_het, d_det_fft, h_det,
-        0, detected_track, 0,
-        output_field_lines, fmt.lines_per_frame, output_line_len,
-        fft_size, freq_bins, fmt.active_line_start, total_raw_samples,
-        het_scale, fsc_bin, bandwidth_bins,
-        d_field_track, d_field_phase_offset);
-
-    double burst_phase_0 = measure_burst_phase(
-        h_det, output_field_lines, fft_size, output_line_len,
-        burst_start, burst_end, fft_scale, fmt.fsc, fmt.output_rate);
-
-    int quadrant_0 = ((int)(burst_phase_0 / 90.0 + 0.5)) % 4;
-
-    // Field 0 is assumed first field; no previous burst → delta = -1
-    auto phase_result_0 = lookup_ntsc_phase(1, quadrant_0, -1);
-    int phase_offset_0 = phase_result_0.offset;
-    int phase_id_0 = phase_result_0.phase_id;
-
-    fprintf(stderr, "  [chroma] Field 0: burst_phase=%.1f° quadrant=%d phase_offset=%d phase_id=%d\n",
-            burst_phase_0, quadrant_0, phase_offset_0, phase_id_0);
 
     // ---------------------------------------------------------------
     // Step 3: Generate per-field track + phase offset arrays
     //
     // Track alternates per field. Phase offset is 0 for all fields —
     // ld-chroma-decoder handles the NTSC 4-frame sequence correction.
-    //
-    // field_phase_ids follows the NTSC 4-field cycle: the pattern
-    // from the phase table repeats every 8 fields (4 frames).
     // ---------------------------------------------------------------
 
     std::vector<int> h_track(num_fields);
     std::vector<int> h_phase_offset(num_fields);
 
-    // NTSC 4-frame phase ID cycle (8 fields):
-    // From the phase table: first fields get phase_id 3,1,3,1
-    //                       second fields get phase_id 2,4,2,4
-    // Combined: 3,2,1,4,3,2,1,4... but the starting position depends on burst measurement.
-    // We use the phase table to determine the correct 8-field cycle.
-    static const int ntsc_phase_id_cycle[8] = { 3, 2, 1, 4, 3, 2, 1, 4 };
-
-    // Find where phase_id_0 appears for a first field in the cycle
-    int cycle_start = 0;
-    for (int i = 0; i < 8; i += 2) {
-        if (ntsc_phase_id_cycle[i] == phase_id_0) {
-            cycle_start = i;
-            break;
-        }
-    }
-
     field_phase_ids.resize(num_fields);
 
     h_track[0] = detected_track;
     h_phase_offset[0] = 0;
-    field_phase_ids[0] = phase_id_0;
+    field_phase_ids[0] = ntsc_phase_id_cycle[(cycle_start) % 8];
 
     // ---------------------------------------------------------------
     // Per-field track validation: detect track flips mid-tape.
@@ -666,7 +679,6 @@ void chroma_decode(const double* d_raw,
     // ---------------------------------------------------------------
 
     int current_track = detected_track;
-    double good_metric_threshold = metric[detected_track] * 4.0;  // allow 4x degradation
 
     for (int f = 1; f < num_fields; f++) {
         int expected_track = (f & 1) ? (1 - current_track) : current_track;
@@ -829,4 +841,15 @@ void chroma_decode(const double* d_raw,
     cudaFree(d_fft_buf);
     cudaFree(d_field_track);
     cudaFree(d_field_phase_offset);
+
+    // Save state for next batch
+    if (state) {
+        state->valid = true;
+        // current_track is the base track for even-indexed fields in this batch.
+        // If batch had odd field count, next batch's field 0 needs the opposite parity.
+        state->current_track = (num_fields & 1) ? (1 - current_track) : current_track;
+        state->good_metric_threshold = good_metric_threshold;
+        // Advance cycle_start by num_fields so next batch continues the sequence
+        state->cycle_start = (cycle_start + num_fields) % 8;
+    }
 }

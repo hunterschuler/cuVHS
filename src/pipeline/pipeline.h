@@ -6,7 +6,7 @@
 #include "io/tbc_writer.h"
 #include "pipeline/fm_demod.h"
 #include "pipeline/sync_pulses.h"
-#include "pipeline/dropout_detect.h"
+#include "pipeline/chroma_decode.h"
 #include "pipeline/dropout_detect.h"
 
 // Orchestrates the full decode pipeline on GPU.
@@ -43,6 +43,9 @@ private:
 
     // Kernel 1: FM demodulation (persistent state — cuFFT plans + filter arrays)
     FMDemodState demod_state;
+
+    // Kernel 6: Chroma state carried across batches (track, phase cycle)
+    ChromaState chroma_state;
 
     // GPU buffer pointers (allocated in run(), freed in destructor)
     // These are device pointers.

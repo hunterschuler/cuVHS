@@ -478,6 +478,7 @@ int Pipeline::process_batch(int start_field, int num_fields) {
 
     // 8. Chroma Decode (Kernel 6)
     // d_demod is reused as scratch — K5 (luma resample) is done with it
+    // Pass &chroma_state to carry track/phase info across batch boundaries
     std::vector<int> field_phase_ids;
     chroma_decode(static_cast<double*>(d_raw),
                   static_cast<double*>(d_linelocs),
@@ -486,7 +487,8 @@ int Pipeline::process_batch(int start_field, int num_fields) {
                   fields_loaded,
                   fields_loaded * (int)spf_padded,
                   fmt,
-                  field_phase_ids);
+                  field_phase_ids,
+                  &chroma_state);
 
     // 9. Dropout Detection + Concealment (Kernel 7)
     dropout_detect(static_cast<double*>(d_raw),
