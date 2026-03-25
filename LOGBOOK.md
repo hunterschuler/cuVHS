@@ -1220,3 +1220,133 @@ completion because stderr was line-buffered when piped to a terminal emulator.
 2. Re-enable NTSC phase sequence after bandpass fix validates
 3. Clean up debug fprintf statements
 4. Test on full 5-minute clip
+
+---
+
+## GPU-Parallel Chroma Track Validation (2026-03-25)
+
+### Problem
+
+The chroma decoder's track validation was the pipeline's primary bottleneck. The original
+implementation processed each field **one at a time** in a serial loop:
+
+1. `process_one_field_chroma()` — launches kernels for 1 field, creates/destroys cuFFT plan
+2. `cudaMemcpy` — downloads ~1.5 MB chroma data to host
+3. `measure_burst_cancellation()` — CPU measurement on downloaded data
+4. If bad metric, repeat with flipped track
+
+With ~411 fields per batch, that was **411 sequential GPU→CPU round-trips** per batch,
+each with cuFFT plan create/destroy overhead. The actual computation was trivial — the
+latency of 411 round-trips dominated.
+
+### Fix (implemented across two sessions)
+
+**Session 1: Eliminated the serial loop.** Restructured `chroma_decode()` Step 4 to
+process all fields in batch-parallel chunks (het+FFT+BPF+IFFT), then added a
+`k_burst_cancellation` GPU kernel that computes per-field burst cancellation metrics
+for all fields simultaneously (one CUDA block per field, 256 threads, shared-memory
+reduction). Metrics downloaded in one `cudaMemcpy` (~3 KB for 411 doubles).
+
+**Session 2: Moved metric scan to GPU.** Added `k_find_first_bad` kernel — one thread
+per field checks metric against threshold, `atomicMin` finds lowest bad index. Download
+reduced to **one int (4 bytes)**. CPU only reads one int and branches.
+
+### Flow (current)
+
+```
+1. Assign expected track pattern (alternating, from carried state)
+2. Upload track assignments to GPU (one memcpy)
+3. Batch het + FFT + bandpass + IFFT (all fields in parallel)
+4. k_burst_cancellation — one block/field, outputs per-field metric
+5. k_find_first_bad — scans metrics on GPU, outputs single int
+6. Download 1 int: if -1 → proceed; if field index → flip tracks, retry (max 3)
+7. k_chroma_acc_output — ACC normalization + uint16 output
+```
+
+Common case (no track flips): **one batch pass, one 4-byte download, zero per-field round-trips.**
+
+### ChromaState carry-over
+
+`ChromaState` struct carries `current_track`, `good_metric_threshold`, and `cycle_start`
+across batch boundaries via `pipeline.h`. Eliminates fresh auto-detection per batch,
+which was causing periodic greyscale dropout (~7-second intervals = batch boundary).
+
+Track parity adjustment on carry: if batch had odd field count, `current_track` flips
+for the next batch (`state->current_track = (num_fields & 1) ? (1 - current_track) : current_track`).
+
+### Performance
+
+| Build | 3min decode | FPS |
+|-------|------------|-----|
+| Before (batch parallel, serial loop still present) | ~33s | ~68 FPS |
+| After (batch parallel, GPU metric scan) SM 86 | 27.4s | 82.0 FPS |
+| After (batch parallel, GPU metric scan) SM 86 retest | 26.7s | 84.3 FPS |
+| After (batch parallel, GPU metric scan) multi-arch | 26.3s | 85.5 FPS |
+| Python vhs-decode (--no_resample) | 115s | 7.8 FPS |
+| Python vhs-decode (with resample) | 159s | 6.1 FPS |
+
+Eliminating the serial round-trip loop: ~68 → ~85 FPS (~25% improvement).
+Single-arch (SM 86) vs multi-arch (60–90) is noise — confirmed with retest.
+No reason to restrict arch; use multi-arch for portability.
+**cuVHS is ~11x faster than Python vhs-decode** on the same hardware and input.
+
+### Remaining serial work in chroma
+
+- **First-batch initial detection:** 2-3 calls to `process_one_field_chroma` to test
+  track=0 vs track=1 on field 0 and measure burst phase. Runs once per file, trivial.
+- **Step 0 bandpass filter:** Processes one field at a time through FFT on GPU (no host
+  transfers). Serial GPU work, not batched. Could be batched for further speedup but
+  would require a much larger temp buffer.
+
+### Files changed
+
+- `src/pipeline/chroma_decode.cu`:
+  - Added `k_burst_cancellation` kernel (batch-parallel burst metric, shared-mem reduction)
+  - Added `k_find_first_bad` kernel (GPU metric scan, atomicMin)
+  - Removed serial `process_one_field_chroma` loop
+  - Restructured Step 4: batch process → GPU metric check → retry on flip → ACC output
+  - `ChromaState` carry-over for batch boundaries
+- `src/pipeline/chroma_decode.h`: Added `ChromaState` struct
+- `src/pipeline/pipeline.h`: Added `ChromaState chroma_state` member
+- `src/pipeline/pipeline.cu`: Pass `&chroma_state` to `chroma_decode()`
+
+---
+
+## Repo Reorganization & Clean Install (2026-03-25)
+
+Separated cuVHS from vhs-decode-faster into fully standalone repos.
+
+### Setup
+
+- **cuVHS:** `/media/hunter/DATA/GitHub/cuVHS/` — pure C++/CUDA, no Python dependency
+  - Build: `mkdir build && cd build && cmake .. -DCMAKE_BUILD_TYPE=Release && make -j$(nproc)`
+  - Multi-arch build is fine (no real perf difference vs single-arch)
+- **vhs-decode:** `/media/hunter/DATA/GitHub/vhs-decode/` — clean upstream clone
+  - Conda env: `vhs-decode` (not `vhs-faster`)
+  - Python: `pip install /media/hunter/DATA/GitHub/vhs-decode/`
+  - ld-tools: `cd vhs-decode/build && cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=$CONDA_PREFIX -DUSE_QWT=OFF && make -j$(nproc) && make install`
+  - ffmpeg: `conda install -n vhs-decode ffmpeg`
+  - tbc-video-export: `pip install tbc-video-export` (separate pip package)
+
+### Tool paths (updated)
+
+```
+/home/hunter/miniforge3/envs/vhs-decode/bin/ffmpeg
+/home/hunter/miniforge3/envs/vhs-decode/bin/tbc-video-export
+/home/hunter/miniforge3/envs/vhs-decode/bin/vhs-decode
+/home/hunter/miniforge3/envs/vhs-decode/bin/ld-dropout-correct
+/home/hunter/miniforge3/envs/vhs-decode/bin/ld-chroma-decoder
+```
+
+**Note:** `tbc-video-export` needs ffmpeg and ld-tools in PATH. Run with:
+```bash
+PATH="/home/hunter/miniforge3/envs/vhs-decode/bin:$PATH" tbc-video-export ...
+```
+
+### Re-key Claude Code conversations
+
+After deleting vhs-decode-faster, run:
+```bash
+mv ~/.claude/projects/-media-hunter-DATA-GitHub-vhs-decode-faster \
+   ~/.claude/projects/-media-hunter-DATA-GitHub-cuVHS
+```

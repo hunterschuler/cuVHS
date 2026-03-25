@@ -295,6 +295,28 @@ __global__ void k_burst_cancellation(
 
 
 // ============================================================================
+// Kernel: Scan burst metrics for first field exceeding threshold
+//
+// One thread per field. atomicMin finds the lowest bad index.
+// Output: d_first_bad[0] = index of first bad field, or INT_MAX if all good.
+// ============================================================================
+
+__global__ void k_find_first_bad(
+    const double* __restrict__ metrics,
+    int* __restrict__ first_bad,    // single int output
+    int num_fields,
+    double threshold)
+{
+    int f = blockIdx.x * blockDim.x + threadIdx.x;
+    if (f >= num_fields) return;
+
+    if (metrics[f] > threshold) {
+        atomicMin(first_bad, f);
+    }
+}
+
+
+// ============================================================================
 // Host-side: Track detection + NTSC phase sequence
 // ============================================================================
 
@@ -800,7 +822,8 @@ void chroma_decode(const double* d_raw,
         return;
     }
     cudaMalloc(&d_metrics, fields_per_chunk * sizeof(double));
-    auto* h_metrics = new double[fields_per_chunk];
+    int* d_first_bad = nullptr;
+    cudaMalloc(&d_first_bad, sizeof(int));
 
     // Create cuFFT plans
     cufftHandle plan_r2c = 0, plan_c2r = 0;
@@ -854,32 +877,41 @@ void chroma_decode(const double* d_raw,
 
             cufftExecZ2D(plan_c2r, d_fft_buf, d_het_buf);
 
-            // GPU burst cancellation measurement (replaces 411 CPU round-trips)
+            // GPU burst cancellation measurement — all fields in parallel
             k_burst_cancellation<<<fields_this, 256>>>(
                 d_het_buf, d_metrics, fields_this,
                 output_field_lines, fft_size,
                 burst_start, burst_end, fft_scale);
 
-            // Download metrics (tiny: fields_this doubles ≈ 3 KB)
-            cudaMemcpy(h_metrics, d_metrics, fields_this * sizeof(double), cudaMemcpyDeviceToHost);
+            // GPU scan for first field exceeding threshold
+            int sentinel = INT_MAX;
+            cudaMemcpy(d_first_bad, &sentinel, sizeof(int), cudaMemcpyHostToDevice);
 
-            // Scan for track flips
-            chunk_ok = true;
-            for (int f = 0; f < fields_this; f++) {
-                if (h_metrics[f] > good_metric_threshold) {
-                    int abs_f = field_start + f;
-                    current_track = 1 - current_track;
-                    fprintf(stderr, "  [chroma] Track flip at field %d: metric %.1f (threshold %.1f), new track=%d\n",
-                            abs_f, h_metrics[f], good_metric_threshold, current_track);
+            {
+                int threads = 256;
+                int blocks = (fields_this + threads - 1) / threads;
+                k_find_first_bad<<<blocks, threads>>>(
+                    d_metrics, d_first_bad, fields_this, good_metric_threshold);
+            }
 
-                    // Reassign tracks from this field onward (entire remaining batch)
-                    for (int ff = abs_f; ff < num_fields; ff++) {
-                        h_track[ff] = (ff & 1) ? (1 - current_track) : current_track;
-                    }
+            // Download single int (4 bytes)
+            int first_bad;
+            cudaMemcpy(&first_bad, d_first_bad, sizeof(int), cudaMemcpyDeviceToHost);
 
-                    chunk_ok = false;
-                    break;  // retry this chunk with corrected tracks
+            if (first_bad == INT_MAX) {
+                chunk_ok = true;
+            } else {
+                int abs_f = field_start + first_bad;
+                current_track = 1 - current_track;
+                fprintf(stderr, "  [chroma] Track flip at field %d (threshold %.1f), new track=%d\n",
+                        abs_f, good_metric_threshold, current_track);
+
+                // Reassign tracks from this field onward (entire remaining batch)
+                for (int ff = abs_f; ff < num_fields; ff++) {
+                    h_track[ff] = (ff & 1) ? (1 - current_track) : current_track;
                 }
+
+                chunk_ok = false;  // retry this chunk with corrected tracks
             }
         }
 
@@ -899,9 +931,9 @@ void chroma_decode(const double* d_raw,
     cudaFree(d_het_buf);
     cudaFree(d_fft_buf);
     cudaFree(d_metrics);
+    cudaFree(d_first_bad);
     cudaFree(d_field_track);
     cudaFree(d_field_phase_offset);
-    delete[] h_metrics;
 
     // Save state for next batch
     if (state) {
