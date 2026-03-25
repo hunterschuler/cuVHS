@@ -1,6 +1,10 @@
 # cuVHS Logbook
 
-## Original Design Document (from vhs-decode-faster)
+> **Note:** This is a development scratchpad, not documentation. Entries are
+> roughly chronological but not in any coherent order — a mix of design notes,
+> debugging traces, and performance measurements.
+
+## Original Design Document
 
 ### Why From Scratch
 
