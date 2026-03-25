@@ -230,6 +230,71 @@ __global__ void k_chroma_acc_output(
 
 
 // ============================================================================
+// Kernel: Per-field burst cancellation metric (GPU — replaces CPU measure)
+//
+// One block per field, 256 threads cooperate to measure burst cancellation.
+// Adjacent-line burst sums should cancel with correct track phase (low metric).
+// Wrong track → constructive addition → high metric.
+// ============================================================================
+
+__global__ void k_burst_cancellation(
+    const double* __restrict__ chroma_data,   // [chunk_lines × fft_size] after IFFT
+    double* __restrict__ metrics,             // [fields_in_chunk] output
+    int fields_in_chunk,
+    int output_field_lines,
+    int fft_size,
+    int burst_start,
+    int burst_end,
+    double fft_scale)
+{
+    int field = blockIdx.x;
+    if (field >= fields_in_chunk) return;
+
+    const int SKIP = 16;  // skip vblank + head switch lines
+    int burst_len = burst_end - burst_start;
+    if (burst_len <= 0) { if (threadIdx.x == 0) metrics[field] = 0.0; return; }
+
+    int num_pairs = (output_field_lines - 2 * SKIP - 1) / 2;
+
+    __shared__ double s_sum[256];
+    __shared__ int s_count[256];
+
+    double my_sum = 0.0;
+    int my_count = 0;
+
+    for (int pair = threadIdx.x; pair < num_pairs; pair += blockDim.x) {
+        int line = SKIP + pair * 2;
+        size_t base_a = ((size_t)field * output_field_lines + line) * fft_size;
+        size_t base_b = base_a + fft_size;
+
+        double pair_sum = 0.0;
+        for (int i = burst_start; i < burst_end; i++) {
+            pair_sum += fabs(chroma_data[base_a + i] * fft_scale
+                          + chroma_data[base_b + i] * fft_scale);
+        }
+        my_sum += pair_sum / burst_len;
+        my_count++;
+    }
+
+    s_sum[threadIdx.x] = my_sum;
+    s_count[threadIdx.x] = my_count;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) {
+            s_sum[threadIdx.x] += s_sum[threadIdx.x + s];
+            s_count[threadIdx.x] += s_count[threadIdx.x + s];
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+        metrics[field] = (s_count[0] > 0) ? s_sum[0] / s_count[0] : 1e9;
+    }
+}
+
+
+// ============================================================================
 // Host-side: Track detection + NTSC phase sequence
 // ============================================================================
 
@@ -654,75 +719,21 @@ void chroma_decode(const double* d_raw,
     }
 
     // ---------------------------------------------------------------
-    // Step 3: Generate per-field track + phase offset arrays
+    // Step 3: Assign all tracks + phase IDs upfront
     //
-    // Track alternates per field. Phase offset is 0 for all fields —
-    // ld-chroma-decoder handles the NTSC 4-frame sequence correction.
+    // Track alternates per field. Phase offset is 0 for all fields.
+    // Track flips (tape edit points) are detected batch-parallel in
+    // Step 4 via GPU burst cancellation kernel — no serial loop.
     // ---------------------------------------------------------------
 
     std::vector<int> h_track(num_fields);
-    std::vector<int> h_phase_offset(num_fields);
-
-    field_phase_ids.resize(num_fields);
-
-    h_track[0] = detected_track;
-    h_phase_offset[0] = 0;
-    field_phase_ids[0] = ntsc_phase_id_cycle[(cycle_start) % 8];
-
-    // ---------------------------------------------------------------
-    // Per-field track validation: detect track flips mid-tape.
-    //
-    // VHS track parity can flip at edit points or signal disruptions.
-    // For each field, process with current track assumption and check
-    // burst cancellation. If metric is bad, flip track for this field
-    // and all subsequent ones.
-    // ---------------------------------------------------------------
+    std::vector<int> h_phase_offset(num_fields, 0);
 
     int current_track = detected_track;
 
-    for (int f = 1; f < num_fields; f++) {
-        int expected_track = (f & 1) ? (1 - current_track) : current_track;
-
-        // Process this field with expected track and measure burst cancellation
-        process_one_field_chroma(
-            chroma_raw, d_linelocs, d_det_het, d_det_fft, h_det,
-            f, expected_track, 0,
-            output_field_lines, fmt.lines_per_frame, output_line_len,
-            fft_size, freq_bins, fmt.active_line_start, total_raw_samples,
-            het_scale, fsc_bin, bandwidth_bins,
-            d_field_track, d_field_phase_offset);
-
-        double m = measure_burst_cancellation(
-            h_det, output_field_lines, fft_size, output_line_len,
-            burst_start, burst_end, fft_scale);
-
-        if (m > good_metric_threshold) {
-            // Burst cancellation failed — try flipped track
-            int flipped_track = 1 - expected_track;
-            process_one_field_chroma(
-                chroma_raw, d_linelocs, d_det_het, d_det_fft, h_det,
-                f, flipped_track, 0,
-                output_field_lines, fmt.lines_per_frame, output_line_len,
-                fft_size, freq_bins, fmt.active_line_start, total_raw_samples,
-                het_scale, fsc_bin, bandwidth_bins,
-                d_field_track, d_field_phase_offset);
-
-            double m_flip = measure_burst_cancellation(
-                h_det, output_field_lines, fft_size, output_line_len,
-                burst_start, burst_end, fft_scale);
-
-            if (m_flip < m) {
-                // Flipped track is better — track parity changed
-                current_track = 1 - current_track;
-                expected_track = flipped_track;
-                fprintf(stderr, "  [chroma] Track flip at field %d: metric %.1f → %.1f, new track=%d\n",
-                        f, m, m_flip, current_track);
-                good_metric_threshold = m_flip * 4.0;
-            }
-        }
-
-        h_track[f] = expected_track;
-        h_phase_offset[f] = 0;
+    field_phase_ids.resize(num_fields);
+    for (int f = 0; f < num_fields; f++) {
+        h_track[f] = (f & 1) ? (1 - current_track) : current_track;
         field_phase_ids[f] = ntsc_phase_id_cycle[(cycle_start + f) % 8];
     }
 
@@ -730,13 +741,18 @@ void chroma_decode(const double* d_raw,
     cudaMemcpy(d_field_track, h_track.data(), num_fields * sizeof(int), cudaMemcpyHostToDevice);
     cudaMemcpy(d_field_phase_offset, h_phase_offset.data(), num_fields * sizeof(int), cudaMemcpyHostToDevice);
 
-    // Free detection buffers
+    // Free detection buffers (only needed for initial auto-detect above)
     cudaFree(d_det_het);
     cudaFree(d_det_fft);
     delete[] h_det;
 
     // ---------------------------------------------------------------
-    // Step 4: Full batch chroma processing with correct phases
+    // Step 4: Batch chroma processing with GPU-parallel flip detection
+    //
+    // Process all fields in chunks through het+FFT+BPF+IFFT, then
+    // measure burst cancellation on GPU (one kernel, no CPU round-trips).
+    // If a track flip is detected, update assignments and retry chunk.
+    // Common case (no flips): one pass, one tiny metric download.
     // ---------------------------------------------------------------
 
     // Determine chunk size from available VRAM
@@ -760,9 +776,12 @@ void chroma_decode(const double* d_raw,
     chunk_lines = (chunk_lines / output_field_lines) * output_field_lines;
     if (chunk_lines < output_field_lines) chunk_lines = output_field_lines;
 
+    int fields_per_chunk = chunk_lines / output_field_lines;
+
     // Allocate temp buffers
     double* d_het_buf = nullptr;
     cufftDoubleComplex* d_fft_buf = nullptr;
+    double* d_metrics = nullptr;
 
     size_t het_bytes = (size_t)chunk_lines * fft_size * sizeof(double);
     size_t fft_bytes = (size_t)chunk_lines * freq_bins * sizeof(cufftDoubleComplex);
@@ -780,6 +799,8 @@ void chroma_decode(const double* d_raw,
         cudaFree(d_het_buf); cudaFree(d_field_track); cudaFree(d_field_phase_offset);
         return;
     }
+    cudaMalloc(&d_metrics, fields_per_chunk * sizeof(double));
+    auto* h_metrics = new double[fields_per_chunk];
 
     // Create cuFFT plans
     cufftHandle plan_r2c = 0, plan_c2r = 0;
@@ -787,8 +808,6 @@ void chroma_decode(const double* d_raw,
 
     cufftPlanMany(&plan_r2c, 1, n, NULL, 1, fft_size, NULL, 1, freq_bins, CUFFT_D2Z, chunk_lines);
     cufftPlanMany(&plan_c2r, 1, n, NULL, 1, freq_bins, NULL, 1, fft_size, CUFFT_Z2D, chunk_lines);
-
-    int fields_per_chunk = chunk_lines / output_field_lines;
 
     for (int field_start = 0; field_start < num_fields; field_start += fields_per_chunk) {
         int fields_this = std::min(fields_per_chunk, num_fields - field_start);
@@ -801,30 +820,70 @@ void chroma_decode(const double* d_raw,
             cufftPlanMany(&plan_c2r, 1, n, NULL, 1, freq_bins, NULL, 1, fft_size, CUFFT_Z2D, lines_this);
         }
 
-        // Resample + heterodyne with correct per-field phases
-        {
-            int total = lines_this * fft_size;
-            int threads = 256;
-            int blocks = (total + threads - 1) / threads;
-            k_resample_raw_het<<<blocks, threads>>>(
-                chroma_raw, d_linelocs, d_het_buf,
-                lines_this, field_start, output_field_lines,
-                fmt.lines_per_frame, output_line_len, fft_size,
-                fmt.active_line_start, total_raw_samples, het_scale,
-                d_field_track, d_field_phase_offset);
+        // Retry loop: process chunk, check for track flips, retry if needed
+        int retries = 3;
+        bool chunk_ok = false;
+
+        while (!chunk_ok && retries-- > 0) {
+            // Upload current track assignments for this chunk
+            cudaMemcpy(d_field_track + field_start, h_track.data() + field_start,
+                       fields_this * sizeof(int), cudaMemcpyHostToDevice);
+
+            // Resample + heterodyne
+            {
+                int total = lines_this * fft_size;
+                int threads = 256;
+                int blocks = (total + threads - 1) / threads;
+                k_resample_raw_het<<<blocks, threads>>>(
+                    chroma_raw, d_linelocs, d_het_buf,
+                    lines_this, field_start, output_field_lines,
+                    fmt.lines_per_frame, output_line_len, fft_size,
+                    fmt.active_line_start, total_raw_samples, het_scale,
+                    d_field_track, d_field_phase_offset);
+            }
+
+            // Forward FFT → bandpass → inverse FFT
+            cufftExecD2Z(plan_r2c, d_het_buf, d_fft_buf);
+
+            {
+                int total = lines_this * freq_bins;
+                int threads = 256;
+                int blocks = (total + threads - 1) / threads;
+                k_chroma_bandpass<<<blocks, threads>>>(d_fft_buf, lines_this, freq_bins, fsc_bin, bandwidth_bins);
+            }
+
+            cufftExecZ2D(plan_c2r, d_fft_buf, d_het_buf);
+
+            // GPU burst cancellation measurement (replaces 411 CPU round-trips)
+            k_burst_cancellation<<<fields_this, 256>>>(
+                d_het_buf, d_metrics, fields_this,
+                output_field_lines, fft_size,
+                burst_start, burst_end, fft_scale);
+
+            // Download metrics (tiny: fields_this doubles ≈ 3 KB)
+            cudaMemcpy(h_metrics, d_metrics, fields_this * sizeof(double), cudaMemcpyDeviceToHost);
+
+            // Scan for track flips
+            chunk_ok = true;
+            for (int f = 0; f < fields_this; f++) {
+                if (h_metrics[f] > good_metric_threshold) {
+                    int abs_f = field_start + f;
+                    current_track = 1 - current_track;
+                    fprintf(stderr, "  [chroma] Track flip at field %d: metric %.1f (threshold %.1f), new track=%d\n",
+                            abs_f, h_metrics[f], good_metric_threshold, current_track);
+
+                    // Reassign tracks from this field onward (entire remaining batch)
+                    for (int ff = abs_f; ff < num_fields; ff++) {
+                        h_track[ff] = (ff & 1) ? (1 - current_track) : current_track;
+                    }
+
+                    chunk_ok = false;
+                    break;  // retry this chunk with corrected tracks
+                }
+            }
         }
 
-        cufftExecD2Z(plan_r2c, d_het_buf, d_fft_buf);
-
-        {
-            int total = lines_this * freq_bins;
-            int threads = 256;
-            int blocks = (total + threads - 1) / threads;
-            k_chroma_bandpass<<<blocks, threads>>>(d_fft_buf, lines_this, freq_bins, fsc_bin, bandwidth_bins);
-        }
-
-        cufftExecZ2D(plan_c2r, d_fft_buf, d_het_buf);
-
+        // ACC normalization + uint16 output
         uint16_t* out_ptr = const_cast<uint16_t*>(
             d_tbc_chroma + (size_t)field_start * output_field_lines * output_line_len);
 
@@ -839,8 +898,10 @@ void chroma_decode(const double* d_raw,
     cufftDestroy(plan_c2r);
     cudaFree(d_het_buf);
     cudaFree(d_fft_buf);
+    cudaFree(d_metrics);
     cudaFree(d_field_track);
     cudaFree(d_field_phase_offset);
+    delete[] h_metrics;
 
     // Save state for next batch
     if (state) {
