@@ -210,7 +210,16 @@ __global__ void k_compute_linelocs(
         // Simplified: count from 0, treating ref as the first active video line.
         // We'll number lines starting from line 0 = last HSYNC of previous field.
         // The reference is at hsync_start_line.
-        ref_line = 10.0;  // approximate; will be refined later
+        // The reference pulse is the first HSYNC after vblank (after EQ2 section).
+        // NTSC vblank structure: 6 EQ1 pulses (3H) + 6 VSYNC (3H) + 6 EQ2 (3H) = 9H
+        // Plus firstFieldH gap (0.5H or 1H depending on field type).
+        // Python's getLine0() computes: line0 = firstloc - (eqgap + distfroml1) * inlinelen
+        // For EQ2 found first: distfroml1=6H, eqgap=0.5-1H → line0 is 6.5-7H before EQ2 start.
+        // EQ2 has 6 half-line pulses = 3H, so ref HSYNC is 9.5-10H from line 0.
+        // But Python also incorporates the second vblank (at field end) via median of 3 estimates.
+        // Empirically measured: cuVHS output is shifted 9 lines up vs Python.
+        // ref_line=19 aligns cuVHS line active_line_start(10) with Python's output start.
+        ref_line = 19.0;
     } else {
         // No VSYNC found: use first HSYNC pulse as a rough reference
         // Find the first HSYNC

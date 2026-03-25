@@ -30,7 +30,7 @@ VideoFormat::VideoFormat(VideoSystem sys, double sample_rate_mhz)
         field_rate       = 59.94;
         frame_rate       = 29.97;
         fsc              = 3579545.0;
-        chroma_under     = 629000.0;
+        chroma_under     = (525.0 * (30.0 / 1.001)) * 40.0;  // 629370.6 Hz (40 × fH)
         luma_carrier     = 3900000.0;   // ~3.4-4.4 MHz typical VHS NTSC
         burst_abs_ref    = 4416.0;
         burst_start_us   = 5.3;
@@ -52,7 +52,7 @@ VideoFormat::VideoFormat(VideoSystem sys, double sample_rate_mhz)
         field_rate       = 50.0;
         frame_rate       = 25.0;
         fsc              = 4433618.75;
-        chroma_under     = 626000.0;
+        chroma_under     = ((625.0 * 25.0) * 40.0) + 1953.0;  // 626953 Hz (40 × fH + 1953)
         luma_carrier     = 3800000.0;   // ~3.4-4.4 MHz typical VHS PAL
         burst_abs_ref    = 5000.0;
         burst_start_us   = 5.6;

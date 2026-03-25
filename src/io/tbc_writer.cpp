@@ -64,6 +64,10 @@ void TBCWriter::set_first_field(bool is_first) {
     current_field.is_first_field = is_first;
 }
 
+void TBCWriter::set_field_phase_id(int phase_id) {
+    current_field.field_phase_id = phase_id;
+}
+
 void TBCWriter::finish_field() {
     field_meta.push_back(current_field);
     current_field = FieldMeta{};
@@ -125,6 +129,9 @@ bool TBCWriter::finalize() {
         fprintf(fp, "    {\n");
         fprintf(fp, "      \"isFirstField\": %s,\n", f.is_first_field ? "true" : "false");
         fprintf(fp, "      \"seqNo\": %d,\n", i + 1);
+        if (f.field_phase_id > 0) {
+            fprintf(fp, "      \"fieldPhaseID\": %d,\n", f.field_phase_id);
+        }
 
         fprintf(fp, "      \"dropOuts\": {\n");
         fprintf(fp, "        \"fieldLine\": [");

@@ -25,6 +25,9 @@ struct TBCWriter {
     // Mark current field as first field (top) or second field (bottom).
     void set_first_field(bool is_first);
 
+    // Set NTSC field phase ID (1-4) for the current field.
+    void set_field_phase_id(int phase_id);
+
     // Advance to next field. Commits metadata for the current field.
     void finish_field();
 
@@ -46,6 +49,7 @@ private:
     // Per-field metadata accumulator (written to JSON at finalize)
     struct FieldMeta {
         bool is_first_field = true;
+        int field_phase_id = 0;  // NTSC: 1-4, 0 = unset
         struct Dropout { int line; int start; int end; };
         std::vector<Dropout> dropouts;
     };

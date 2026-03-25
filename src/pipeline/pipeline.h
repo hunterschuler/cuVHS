@@ -1,4 +1,5 @@
 #pragma once
+#include <vector>
 #include "gpu/device.h"
 #include "format/video_format.h"
 #include "io/raw_reader.h"
@@ -61,11 +62,18 @@ private:
     void* d_do_ends = nullptr;     // dropout end columns
     void* d_do_count = nullptr;    // dropout count per field
 
+    // Pre-scanned field start offsets (sample positions in raw file)
+    std::vector<size_t> field_offsets;
+
     size_t bytes_per_field() const;
     bool allocate_buffers();
     void free_buffers();
 
-    // Process one batch of fields. Reads sequentially from the reader.
+    // Pre-scan the raw file to find VSYNC-based field boundaries.
+    // Populates field_offsets[].
+    bool prescan_field_boundaries();
+
+    // Process one batch of fields using pre-scanned offsets.
     // Returns number of fields processed (0 at EOF).
-    int process_batch(int num_fields);
+    int process_batch(int start_field, int num_fields);
 };
