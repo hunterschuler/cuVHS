@@ -1629,4 +1629,23 @@ Batch size was capped at 512 by a hardcoded limit, leaving 55 GB of the A100's 8
 unused. Removed the cap — the VRAM budget (`gpu.max_batch_size()` at 80% of free VRAM)
 is the real constraint. Stream mode retains a 64-field cap for latency.
 
-Performance unchanged: 92.4 FPS (was 90.4 FPS — within noise).
+Second run after cap removal: **133.5 FPS** (~4.5x real-time NTSC) with batch size 1372,
+using ~59 GB VRAM. The larger batches let cuFFT amortize plan overhead across more fields.
+
+VRAM allocation currently uses a fixed 80% ceiling — see next entry.
+
+## Try-and-Backoff VRAM Allocation (2026-03-25)
+
+Replaced the hardcoded 80% VRAM fraction with a try-and-backoff loop. The pipeline now
+starts at 95% of free VRAM, attempts all `cudaMalloc`s + cuFFT plan creation, and if
+anything fails it frees everything and retries at 90%, 85%, etc. down to 50%.
+
+**Why:** The old 80% was conservative — it left headroom for cuFFT workspace that we
+can't predict exactly (depends on FFT size, batch count, and driver internals). But on
+big GPUs like the A100, that 20% waste is 16 GB — enough for ~270 more fields in the
+batch. The try-and-backoff approach discovers the real limit empirically.
+
+**Behavior:** On most GPUs, 95% succeeds on the first try (cuFFT workspace is a small
+fraction of total). If it fails, the user sees a one-line "backing off" message and the
+next attempt runs immediately. Worst case is ~10 failed attempts (~1 second of startup)
+before settling at 50%.

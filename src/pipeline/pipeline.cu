@@ -105,70 +105,80 @@ size_t Pipeline::bytes_per_field() const {
 }
 
 bool Pipeline::allocate_buffers() {
-    batch_size = gpu.max_batch_size(bytes_per_field(), 0.8);
+    // Try-and-backoff: start aggressive (95% of free VRAM), back off on failure.
+    // This maximizes batch size without needing to predict cuFFT workspace overhead.
+    for (double fraction = 0.95; fraction >= 0.50; fraction -= 0.05) {
+        batch_size = gpu.max_batch_size(bytes_per_field(), fraction);
 
-    // In stream mode, use smaller batches for lower latency
-    if (reader.is_stream() && batch_size > 64) batch_size = 64;
-    if (batch_size < 1) batch_size = 1;
+        // In stream mode, use smaller batches for lower latency
+        if (reader.is_stream() && batch_size > 64) batch_size = 64;
+        if (batch_size < 1) batch_size = 1;
 
-    fprintf(stderr, "Batch size: %d fields (%.1f MB per field, %.1f MB total)%s\n",
-            batch_size,
-            bytes_per_field() / (1024.0 * 1024.0),
-            batch_size * bytes_per_field() / (1024.0 * 1024.0),
-            reader.is_stream() ? " [stream mode]" : "");
+        fprintf(stderr, "Trying %.0f%% VRAM → batch %d fields (%.1f MB per field, %.1f MB total)%s\n",
+                fraction * 100, batch_size,
+                bytes_per_field() / (1024.0 * 1024.0),
+                batch_size * bytes_per_field() / (1024.0 * 1024.0),
+                reader.is_stream() ? " [stream mode]" : "");
 
-    size_t n = batch_size;
-    size_t spf = fmt.samples_per_field;
-    size_t spf_padded = spf + FIELD_MARGIN_LINES * fmt.samples_per_line;
-    size_t tbc_field_size = fmt.output_line_len * fmt.output_field_lines;
+        size_t n = batch_size;
+        size_t spf = fmt.samples_per_field;
+        size_t spf_padded = spf + FIELD_MARGIN_LINES * fmt.samples_per_line;
+        size_t tbc_field_size = fmt.output_line_len * fmt.output_field_lines;
 
-    fprintf(stderr, "  Field margin: %d lines (%zu extra samples, spf_padded=%zu)\n",
-            FIELD_MARGIN_LINES, spf_padded - spf, spf_padded);
+        size_t vram_free_before, vram_total;
+        cudaMemGetInfo(&vram_free_before, &vram_total);
 
-    size_t vram_free_before, vram_total;
-    cudaMemGetInfo(&vram_free_before, &vram_total);
+        bool ok = true;
+        auto alloc = [&ok](void** ptr, size_t bytes) {
+            if (!ok) return;
+            cudaError_t err = cudaMalloc(ptr, bytes);
+            if (err != cudaSuccess) {
+                ok = false;
+                cudaGetLastError();  // clear the error
+            }
+        };
 
-    auto alloc = [](void** ptr, size_t bytes) -> bool {
-        cudaError_t err = cudaMalloc(ptr, bytes);
-        if (err != cudaSuccess) {
-            fprintf(stderr, "cudaMalloc(%zu bytes) failed: %s\n", bytes, cudaGetErrorString(err));
-            return false;
+        // All raw/demod buffers use spf_padded stride so each field's demod data
+        // includes continuation samples past the nominal boundary (for TBC resampler).
+        alloc(&d_raw,        n * spf_padded * sizeof(double));
+        alloc(&d_demod,      n * spf_padded * sizeof(double));
+        alloc(&d_demod_05,   n * spf_padded * sizeof(double));
+        alloc(&d_envelope,   n * spf_padded * sizeof(double));
+        alloc(&d_pulse_starts,  n * MAX_PULSES * sizeof(int));
+        alloc(&d_pulse_lengths, n * MAX_PULSES * sizeof(int));
+        alloc(&d_pulse_count,   n * sizeof(int));
+        alloc(&d_pulse_types,   n * MAX_PULSES * sizeof(int));
+        alloc(&d_linelocs,   n * fmt.lines_per_frame * sizeof(double));
+        alloc(&d_is_first_field, n * sizeof(int));
+        alloc(&d_tbc_luma,   n * tbc_field_size * sizeof(uint16_t));
+        alloc(&d_tbc_chroma, n * tbc_field_size * sizeof(uint16_t));
+        alloc(&d_do_lines,  n * MAX_DROPOUTS_PER_FIELD * sizeof(int));
+        alloc(&d_do_starts, n * MAX_DROPOUTS_PER_FIELD * sizeof(int));
+        alloc(&d_do_ends,   n * MAX_DROPOUTS_PER_FIELD * sizeof(int));
+        alloc(&d_do_count,  n * sizeof(int));
+
+        // Initialize FM demod state (cuFFT plans + filter arrays + scratch buffers)
+        // Use spf_padded so FFT plans are sized for the larger field
+        if (ok) ok = demod_state.init(fmt, batch_size, (int)spf_padded);
+
+        if (ok) {
+            fprintf(stderr, "  Field margin: %d lines (%zu extra samples, spf_padded=%zu)\n",
+                    FIELD_MARGIN_LINES, spf_padded - spf, spf_padded);
+            size_t vram_free_after, vram_dummy;
+            cudaMemGetInfo(&vram_free_after, &vram_dummy);
+            fprintf(stderr, "  VRAM used: %.1f GB, remaining: %.1f GB\n",
+                    (vram_free_before - vram_free_after) / 1e9, vram_free_after / 1e9);
+            return true;
         }
-        return true;
-    };
 
-    // All raw/demod buffers use spf_padded stride so each field's demod data
-    // includes continuation samples past the nominal boundary (for TBC resampler).
-    if (!alloc(&d_raw,        n * spf_padded * sizeof(double)))    return false;
-    if (!alloc(&d_demod,      n * spf_padded * sizeof(double)))    return false;
-    if (!alloc(&d_demod_05,   n * spf_padded * sizeof(double)))    return false;
-    if (!alloc(&d_envelope,   n * spf_padded * sizeof(double)))    return false;
-    if (!alloc(&d_pulse_starts,  n * MAX_PULSES * sizeof(int)))  return false;
-    if (!alloc(&d_pulse_lengths, n * MAX_PULSES * sizeof(int)))  return false;
-    if (!alloc(&d_pulse_count,   n * sizeof(int)))               return false;
-    if (!alloc(&d_pulse_types,   n * MAX_PULSES * sizeof(int)))  return false;
-    if (!alloc(&d_linelocs,   n * fmt.lines_per_frame * sizeof(double))) return false;
-    if (!alloc(&d_is_first_field, n * sizeof(int)))                      return false;
-    if (!alloc(&d_tbc_luma,   n * tbc_field_size * sizeof(uint16_t)))    return false;
-    if (!alloc(&d_tbc_chroma, n * tbc_field_size * sizeof(uint16_t)))    return false;
-    if (!alloc(&d_do_lines,  n * MAX_DROPOUTS_PER_FIELD * sizeof(int))) return false;
-    if (!alloc(&d_do_starts, n * MAX_DROPOUTS_PER_FIELD * sizeof(int))) return false;
-    if (!alloc(&d_do_ends,   n * MAX_DROPOUTS_PER_FIELD * sizeof(int))) return false;
-    if (!alloc(&d_do_count,  n * sizeof(int)))                          return false;
-
-    // Initialize FM demod state (cuFFT plans + filter arrays + scratch buffers)
-    // Use spf_padded so FFT plans are sized for the larger field
-    if (!demod_state.init(fmt, batch_size, (int)spf_padded)) {
-        fprintf(stderr, "Failed to initialize FM demod\n");
-        return false;
+        // Allocation failed at this fraction — clean up and try a smaller batch
+        fprintf(stderr, "  Allocation failed at %.0f%%, backing off...\n", fraction * 100);
+        demod_state.destroy();
+        free_buffers();
     }
 
-    size_t vram_free_after, vram_dummy;
-    cudaMemGetInfo(&vram_free_after, &vram_dummy);
-    fprintf(stderr, "  VRAM used: %.1f GB, remaining: %.1f GB\n",
-            (vram_free_before - vram_free_after) / 1e9, vram_free_after / 1e9);
-
-    return true;
+    fprintf(stderr, "Failed to allocate GPU buffers even at 50%% VRAM\n");
+    return false;
 }
 
 void Pipeline::free_buffers() {
