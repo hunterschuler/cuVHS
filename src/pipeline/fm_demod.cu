@@ -227,6 +227,25 @@ __global__ void k_compute_angles(
     angles[idx] = atan2(analytic[idx].y, analytic[idx].x);
 }
 
+// Compute RF envelope magnitude from complex analytic signal: sqrt(re² + im²)
+// Must be called BEFORE angle extraction, which overwrites the analytic buffer.
+__global__ void k_compute_envelope(
+    const cufftDoubleComplex* __restrict__ analytic,
+    double* __restrict__ envelope,
+    int spf,
+    int fft_size,
+    int total_fields)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = total_fields * spf;
+    if (idx >= total) return;
+    int field = idx / spf;
+    int sample = idx % spf;
+    int src = field * fft_size + sample;
+    double re = analytic[src].x, im = analytic[src].y;
+    envelope[idx] = sqrt(re * re + im * im);
+}
+
 // Sequential phase unwrap: one thread per field.
 // Matches Python: ediff1d(angles, to_begin=0) -> unwrap -> clamp [0,2pi] -> scale
 __global__ void k_unwrap_to_hz(
@@ -455,6 +474,7 @@ void fm_demod(FMDemodState& state,
               const double* d_raw,
               double* d_demod,
               double* d_demod_05,
+              double* d_envelope,
               int num_fields,
               size_t samples_per_field,
               const VideoFormat& fmt)
@@ -503,6 +523,13 @@ void fm_demod(FMDemodState& state,
 
     // Step 5: C2C inverse FFT -> complex analytic signal (in-place)
     cufftExecZ2Z(state.plan_c2c_inv, state.d_analytic, state.d_analytic, CUFFT_INVERSE);
+
+    // Step 5b: Compute RF envelope from analytic signal (before angle extraction overwrites it)
+    if (d_envelope) {
+        int total = num_fields * spf;
+        int blocks = (total + T - 1) / T;
+        k_compute_envelope<<<blocks, T>>>(state.d_analytic, d_envelope, spf, fs, num_fields);
+    }
 
     // Step 6a: Extract phase angles in parallel
     // Reuse first half of d_analytic memory as double* for angles.

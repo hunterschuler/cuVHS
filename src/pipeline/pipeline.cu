@@ -67,6 +67,7 @@ size_t Pipeline::bytes_per_field() const {
     size_t raw = spf_padded * sizeof(double);                  // input (converted, padded)
     size_t demod = spf_padded * sizeof(double);                // demod output (padded)
     size_t demod_05 = spf_padded * sizeof(double);             // sync demod (padded)
+    size_t envelope = spf_padded * sizeof(double);             // RF envelope magnitude
     size_t pulses = MAX_PULSES * 3 * sizeof(int) + sizeof(int); // starts + lengths + types + count
     size_t linelocs = fmt.lines_per_frame * sizeof(double);    // line locations
     size_t tbc = fmt.output_line_len * fmt.output_field_lines * sizeof(uint16_t);  // luma
@@ -100,7 +101,7 @@ size_t Pipeline::bytes_per_field() const {
     }
     size_t cufft_workspace = ws_r2c + ws_c2c + ws_c2r;
 
-    return raw + demod + demod_05 + pulses + linelocs + tbc + chroma + k1_scratch + dropouts + cufft_workspace;
+    return raw + demod + demod_05 + envelope + pulses + linelocs + tbc + chroma + k1_scratch + dropouts + cufft_workspace;
 }
 
 bool Pipeline::allocate_buffers() {
@@ -143,11 +144,13 @@ bool Pipeline::allocate_buffers() {
     if (!alloc(&d_raw,        n * spf_padded * sizeof(double)))    return false;
     if (!alloc(&d_demod,      n * spf_padded * sizeof(double)))    return false;
     if (!alloc(&d_demod_05,   n * spf_padded * sizeof(double)))    return false;
+    if (!alloc(&d_envelope,   n * spf_padded * sizeof(double)))    return false;
     if (!alloc(&d_pulse_starts,  n * MAX_PULSES * sizeof(int)))  return false;
     if (!alloc(&d_pulse_lengths, n * MAX_PULSES * sizeof(int)))  return false;
     if (!alloc(&d_pulse_count,   n * sizeof(int)))               return false;
     if (!alloc(&d_pulse_types,   n * MAX_PULSES * sizeof(int)))  return false;
     if (!alloc(&d_linelocs,   n * fmt.lines_per_frame * sizeof(double))) return false;
+    if (!alloc(&d_is_first_field, n * sizeof(int)))                      return false;
     if (!alloc(&d_tbc_luma,   n * tbc_field_size * sizeof(uint16_t)))    return false;
     if (!alloc(&d_tbc_chroma, n * tbc_field_size * sizeof(uint16_t)))    return false;
     if (!alloc(&d_do_lines,  n * MAX_DROPOUTS_PER_FIELD * sizeof(int))) return false;
@@ -177,11 +180,13 @@ void Pipeline::free_buffers() {
     safe_free(&d_raw);
     safe_free(&d_demod);
     safe_free(&d_demod_05);
+    safe_free(&d_envelope);
     safe_free(&d_pulse_starts);
     safe_free(&d_pulse_lengths);
     safe_free(&d_pulse_count);
     safe_free(&d_pulse_types);
     safe_free(&d_linelocs);
+    safe_free(&d_is_first_field);
     safe_free(&d_tbc_luma);
     safe_free(&d_tbc_chroma);
     safe_free(&d_do_lines);
@@ -213,56 +218,97 @@ bool Pipeline::prescan_field_boundaries() {
     fprintf(stderr, "Pre-scanning for field boundaries...\n");
     auto t0 = std::chrono::steady_clock::now();
 
-    // Read entire file as raw bytes
-    auto* raw = new uint8_t[total_samples];
-    size_t n_read = reader.read_raw_at(raw, 0, total_samples);
-    if (n_read < spf) {
-        fprintf(stderr, "  Failed to read raw data (%zu samples)\n", n_read);
-        delete[] raw;
-        return false;
-    }
-
-    // Sliding window mean — half a line width
-    int window = (int)(fmt.samples_per_line / 2);
-    if (window < 100) window = 100;
-
-    // Compute global mean for threshold
-    double global_sum = 0;
-    for (size_t i = 0; i < n_read; i++) global_sum += raw[i];
-    double global_mean = global_sum / n_read;
-    double threshold = global_mean * 0.85;
-
-    // Minimum run length for VSYNC
+    // Dual sliding window parameters
+    int short_win = (int)(fmt.samples_per_line / 2);   // ~890 samples (half a line)
+    if (short_win < 100) short_win = 100;
+    size_t long_win = spf * 50;                         // ~50 fields for local baseline
     int vsync_min_run = (int)(fmt.vsync_width * 0.5);
 
-    // Sliding window scan
-    double wsum = 0;
-    for (int i = 0; i < window && i < (int)n_read; i++) wsum += raw[i];
+    // Chunked I/O: 256 MB chunks, overlapping by long_win
+    size_t chunk_bytes = 256 * 1024 * 1024;
+    size_t overlap = long_win;
+    auto* buf = new uint8_t[chunk_bytes + overlap];
 
-    // Phase 1: find type-A field boundaries (strong VSYNC dips)
     std::vector<size_t> type_a;
-    int run_len = 0;
     size_t last_end = 0;
 
-    for (size_t i = window; i < n_read; i++) {
-        wsum += raw[i];
-        wsum -= raw[i - window];
-        double wmean = wsum / window;
+    // Sliding window state (carried across chunks)
+    double short_sum = 0.0;
+    double long_sum = 0.0;
+    size_t long_count = 0;    // grows from short_win up to long_win
+    int run_len = 0;
 
-        if (wmean < threshold) {
-            run_len++;
+    int num_chunks = (int)((total_samples + chunk_bytes - 1) / chunk_bytes);
+    int chunk_idx = 0;
+
+    for (size_t chunk_start = 0; chunk_start < total_samples; ) {
+        // Read this chunk (with overlap from previous if not first)
+        size_t read_start = (chunk_start > overlap && chunk_idx > 0)
+                            ? chunk_start - overlap : chunk_start;
+        size_t read_len = std::min(chunk_bytes + overlap, total_samples - read_start);
+        size_t n_read = reader.read_raw_at(buf, read_start, read_len);
+        if (n_read < (size_t)short_win) break;
+
+        // On first chunk, initialize short window
+        size_t scan_start_in_buf = (chunk_idx == 0) ? (size_t)short_win : overlap;
+
+        if (chunk_idx == 0) {
+            short_sum = 0.0;
+            for (int i = 0; i < short_win; i++) short_sum += buf[i];
+            long_sum = short_sum;
+            long_count = short_win;
         } else {
-            if (run_len >= vsync_min_run) {
-                if (type_a.empty() || (i - last_end) > spf / 2) {
-                    type_a.push_back(i);  // end of VSYNC dip = approx field start
-                    last_end = i;
-                }
-            }
-            run_len = 0;
+            // Re-initialize windows from overlap region
+            short_sum = 0.0;
+            for (size_t i = scan_start_in_buf - short_win; i < scan_start_in_buf; i++)
+                short_sum += buf[i];
+            long_sum = 0.0;
+            size_t lw_actual = std::min(long_count, scan_start_in_buf);
+            for (size_t i = scan_start_in_buf - lw_actual; i < scan_start_in_buf; i++)
+                long_sum += buf[i];
+            long_count = lw_actual;
         }
-    }
 
-    delete[] raw;
+        // Scan this chunk
+        for (size_t i = scan_start_in_buf; i < n_read; i++) {
+            // Update short window
+            short_sum += buf[i];
+            short_sum -= buf[i - short_win];
+
+            // Update long window (growing phase: expand until long_win reached)
+            long_sum += buf[i];
+            if (long_count < long_win) {
+                long_count++;
+            } else {
+                long_sum -= buf[i - long_win];
+            }
+
+            double short_mean = short_sum / short_win;
+            double long_mean = long_sum / (double)long_count;
+
+            size_t abs_pos = read_start + i;
+
+            if (short_mean < long_mean * 0.85) {
+                run_len++;
+            } else {
+                if (run_len >= vsync_min_run) {
+                    if (type_a.empty() || (abs_pos - last_end) > spf / 2) {
+                        type_a.push_back(abs_pos);
+                        last_end = abs_pos;
+                    }
+                }
+                run_len = 0;
+            }
+        }
+
+        chunk_start += chunk_bytes;
+        chunk_idx++;
+        fprintf(stderr, "\r  [prescan] chunk %d/%d (%.0f%%)...",
+                chunk_idx, num_chunks, 100.0 * chunk_start / total_samples);
+    }
+    fprintf(stderr, "\n");
+
+    delete[] buf;
 
     auto t_scan = std::chrono::steady_clock::now();
     double scan_ms = std::chrono::duration<double, std::milli>(t_scan - t0).count();
@@ -399,6 +445,7 @@ int Pipeline::process_batch(int start_field, int num_fields) {
              static_cast<double*>(d_raw),
              static_cast<double*>(d_demod),
              static_cast<double*>(d_demod_05),
+             static_cast<double*>(d_envelope),
              fields_loaded, spf_padded, fmt);
 
     // --- Debug: dump post-K1 demod_05 for target fields ---
@@ -444,6 +491,7 @@ int Pipeline::process_batch(int start_field, int num_fields) {
               static_cast<int*>(d_pulse_count),
               static_cast<int*>(d_pulse_types),
               static_cast<double*>(d_linelocs),
+              static_cast<int*>(d_is_first_field),
               fields_loaded, fmt);
 
     // 6. Refine Line Locations via Hsync Zero-Crossing (Kernel 4)
@@ -491,7 +539,7 @@ int Pipeline::process_batch(int start_field, int num_fields) {
                   &chroma_state);
 
     // 9. Dropout Detection + Concealment (Kernel 7)
-    dropout_detect(static_cast<double*>(d_raw),
+    dropout_detect(static_cast<double*>(d_envelope),
                    static_cast<double*>(d_linelocs),
                    static_cast<uint16_t*>(d_tbc_luma),
                    static_cast<uint16_t*>(d_tbc_chroma),
@@ -522,10 +570,29 @@ int Pipeline::process_batch(int start_field, int num_fields) {
     cudaMemcpy(h_do_ends, d_do_ends, do_buf_size * sizeof(int), cudaMemcpyDeviceToHost);
     cudaMemcpy(h_do_count, d_do_count, fields_loaded * sizeof(int), cudaMemcpyDeviceToHost);
 
+    // Download field parity
+    auto* h_is_first = new int[fields_loaded];
+    cudaMemcpy(h_is_first, d_is_first_field, fields_loaded * sizeof(int), cudaMemcpyDeviceToHost);
+
+    static bool last_parity = true;
+
     for (int i = 0; i < fields_loaded; i++) {
         writer.write_luma_field(h_luma + i * tbc_field_size);
         writer.write_chroma_field(h_chroma + i * tbc_field_size);
-        writer.set_first_field(i % 2 == 0);
+
+        // Field parity: use VSYNC-based detection, but enforce alternation.
+        // Two consecutive fields can never have the same parity in valid interlaced video.
+        // Detection is only useful to establish initial parity or correct after a glitch.
+        bool first_field;
+        if (h_is_first[i] >= 0 && (h_is_first[i] == 1) != last_parity) {
+            // Detection agrees with alternation — trust it
+            first_field = (h_is_first[i] == 1);
+        } else {
+            // Unknown OR detection conflicts with alternation — alternate
+            first_field = !last_parity;
+        }
+        last_parity = first_field;
+        writer.set_first_field(first_field);
 
         // Set NTSC field phase ID if available
         if (i < (int)field_phase_ids.size() && field_phase_ids[i] > 0) {
@@ -550,6 +617,7 @@ int Pipeline::process_batch(int start_field, int num_fields) {
     delete[] h_do_starts;
     delete[] h_do_ends;
     delete[] h_do_count;
+    delete[] h_is_first;
 
     return fields_loaded;
 }

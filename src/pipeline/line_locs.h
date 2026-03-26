@@ -30,5 +30,6 @@ void line_locs(const int* d_pulse_starts,
                const int* d_pulse_count,
                int* d_pulse_types,
                double* d_linelocs,
+               int* d_is_first_field,    // [num_fields] output: 1=first, 0=second, -1=unknown
                int num_fields,
                const VideoFormat& fmt);

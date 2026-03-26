@@ -11,25 +11,24 @@
 #define ENV_BLOCK_SIZE    16      // local RMS block size (samples)
 
 // ============================================================================
-// Kernel 1: Compute mean squared amplitude per field (parallel reduction)
+// Kernel 1: Compute mean envelope amplitude per field (parallel reduction)
 // ============================================================================
 
-__global__ void k_field_mean_sq(
-    const double* __restrict__ raw,
-    double* __restrict__ field_mean_sq,
+__global__ void k_field_mean_env(
+    const double* __restrict__ envelope,
+    double* __restrict__ field_mean_env,
     int num_fields,
     int samples_per_field)
 {
     int field = blockIdx.x;
     if (field >= num_fields) return;
 
-    const double* field_raw = raw + (size_t)field * samples_per_field;
+    const double* field_env = envelope + (size_t)field * samples_per_field;
 
     // Each thread accumulates its portion
     double sum = 0.0;
     for (int i = threadIdx.x; i < samples_per_field; i += blockDim.x) {
-        double v = field_raw[i];
-        sum += v * v;
+        sum += field_env[i];
     }
 
     // Warp-level reduction
@@ -49,7 +48,7 @@ __global__ void k_field_mean_sq(
         int nwarps = (blockDim.x + 31) / 32;
         for (int w = 0; w < nwarps; w++)
             total += warp_sums[w];
-        field_mean_sq[field] = total / (double)samples_per_field;
+        field_mean_env[field] = total / (double)samples_per_field;
     }
 }
 
@@ -73,9 +72,9 @@ __device__ int find_tbc_line(const double* linelocs, int als, int n_lines, doubl
 }
 
 __global__ void k_detect_and_map(
-    const double* __restrict__ raw,
+    const double* __restrict__ envelope,
     const double* __restrict__ linelocs,
-    const double* __restrict__ field_mean_sq,
+    const double* __restrict__ field_mean_env,
     int* __restrict__ do_lines,
     int* __restrict__ do_starts,
     int* __restrict__ do_ends,
@@ -98,13 +97,10 @@ __global__ void k_detect_and_map(
     int* my_starts = do_starts + field * max_do;
     int* my_ends   = do_ends   + field * max_do;
 
-    // Compute thresholds (squared to avoid sqrt in inner loop)
-    double mean_sq = field_mean_sq[field];
-    double field_rms = sqrt(mean_sq);
-    double down_thresh = field_rms * DOD_THRESHOLD_P;
+    // Compute thresholds from mean envelope (no sqrt needed)
+    double mean_env = field_mean_env[field];
+    double down_thresh = mean_env * DOD_THRESHOLD_P;
     double up_thresh = down_thresh * DOD_HYSTERESIS;
-    double down_sq = down_thresh * down_thresh;
-    double up_sq = up_thresh * up_thresh;
 
     // Determine RF scan range from linelocs (active video region only)
     int field_start = field * samples_per_field;
@@ -132,21 +128,20 @@ __global__ void k_detect_and_map(
         int blk_start = scan_start + blk * ENV_BLOCK_SIZE;
         int blk_end = min(blk_start + ENV_BLOCK_SIZE, scan_end);
 
-        // Compute block mean squared (raw positions are absolute in batch)
+        // Compute block mean envelope
         double block_sum = 0.0;
         int blk_len = blk_end - blk_start;
         for (int i = blk_start; i < blk_end; i++) {
-            double v = raw[i];
-            block_sum += v * v;
+            block_sum += envelope[i];
         }
-        double block_mean_sq = block_sum / (double)blk_len;
+        double block_mean_env = block_sum / (double)blk_len;
 
-        if (block_mean_sq <= down_sq) {
+        if (block_mean_env <= down_thresh) {
             // Below threshold — start or continue dropout
             if (rf_do_start < 0) {
                 rf_do_start = blk_start;
             }
-        } else if (block_mean_sq >= up_sq) {
+        } else if (block_mean_env >= up_thresh) {
             // Above threshold — end dropout if active
             if (rf_do_start >= 0) {
                 int do_end = blk_start;
@@ -299,7 +294,7 @@ __global__ void k_conceal(
 // Host entry point
 // ============================================================================
 
-void dropout_detect(const double* d_raw,
+void dropout_detect(const double* d_envelope,
                     const double* d_linelocs,
                     uint16_t* d_tbc_luma,
                     uint16_t* d_tbc_chroma,
@@ -311,23 +306,23 @@ void dropout_detect(const double* d_raw,
                     size_t samples_per_field,
                     const VideoFormat& fmt)
 {
-    // Allocate temp buffer for field mean squared amplitude
-    double* d_field_mean_sq = nullptr;
-    cudaMalloc(&d_field_mean_sq, num_fields * sizeof(double));
+    // Allocate temp buffer for field mean envelope amplitude
+    double* d_field_mean_env = nullptr;
+    cudaMalloc(&d_field_mean_env, num_fields * sizeof(double));
 
     // Zero the dropout count
     cudaMemset(d_do_count, 0, num_fields * sizeof(int));
 
-    // Kernel 1: Compute field mean squared amplitude
-    k_field_mean_sq<<<num_fields, 256>>>(
-        d_raw, d_field_mean_sq, num_fields, (int)samples_per_field);
+    // Kernel 1: Compute field mean envelope amplitude
+    k_field_mean_env<<<num_fields, 256>>>(
+        d_envelope, d_field_mean_env, num_fields, (int)samples_per_field);
 
     // Kernel 2: Detect dropouts and map to TBC positions
     {
         int threads = 64;
         int blocks = (num_fields + threads - 1) / threads;
         k_detect_and_map<<<blocks, threads>>>(
-            d_raw, d_linelocs, d_field_mean_sq,
+            d_envelope, d_linelocs, d_field_mean_env,
             d_do_lines, d_do_starts, d_do_ends, d_do_count,
             num_fields, (int)samples_per_field,
             fmt.lines_per_frame, fmt.output_field_lines,
@@ -340,5 +335,5 @@ void dropout_detect(const double* d_raw,
         d_do_lines, d_do_starts, d_do_ends, d_do_count,
         num_fields, fmt.output_line_len, fmt.output_field_lines);
 
-    cudaFree(d_field_mean_sq);
+    cudaFree(d_field_mean_env);
 }

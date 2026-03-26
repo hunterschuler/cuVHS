@@ -1347,10 +1347,275 @@ Separated cuVHS from vhs-decode-faster into fully standalone repos.
 PATH="/home/hunter/miniforge3/envs/vhs-decode/bin:$PATH" tbc-video-export ...
 ```
 
-### Re-key Claude Code conversations
+---
 
-After deleting vhs-decode-faster, run:
-```bash
-mv ~/.claude/projects/-media-hunter-DATA-GitHub-vhs-decode-faster \
-   ~/.claude/projects/-media-hunter-DATA-GitHub-cuVHS
+## Streaming Prescan — Fix OOM on Large Files (2026-03-25)
+
+### Problem
+
+`prescan_field_boundaries()` loaded the entire raw file into RAM (`new uint8_t[total_samples]`)
+to do a sliding window VSYNC scan. For a 192 GB tape with 125 GB system RAM, this was an
+immediate `std::bad_alloc` crash.
+
+### Fix
+
+Replaced the single-allocation approach with a chunked streaming scan using two sliding windows:
+
+- **Short window** (~890 samples, half a scan line): detects the VSYNC amplitude dip
+- **Long window** (~23.4M samples, ~50 fields): tracks local signal baseline
+
+VSYNC detected when `short_mean < long_mean * 0.85`. This is a relative threshold that
+adapts to local signal level, handling edit points where different recording hardware may
+have different DC offsets or amplitudes. No global mean computation needed — single pass.
+
+The long window was originally ~2 fields, but this was too short — on a 2-hour tape it only
+found 30,032 of ~215,000 fields because VSYNC dips barely moved the short-term average
+relative to such a small baseline. Increasing to 50 fields fixed detection completely.
+
+**Chunk sizing:** Fixed 256 MB chunks, overlapping by `long_win` samples so both windows
+stay valid across boundaries. At each new chunk, windows are re-initialized from the
+overlap region. Progress reported per-chunk to stderr.
+
+**Growing window:** The long window starts with `short_win` samples and grows to `long_win`
+over the first ~50 fields. This ensures detection starts at sample `short_win` (matching the
+old code) rather than waiting for the long window to fill. Verified: 30s clip produces
+identical field count (1757) with both old and new prescan.
+
+### Files changed
+
+- `src/pipeline/pipeline.cu`: Rewrote `prescan_field_boundaries()` — chunked I/O,
+  dual sliding window, fixed 256 MB chunk size.
+
+---
+
+## Future: CPU-Only C++ Backend
+
+**Motivation:** A CPU-only backend would eliminate the NVIDIA GPU requirement, opening
+cuVHS to AMD, Intel, laptops, servers, and Apple Silicon. The core DSP (FFTs, filters,
+sliding windows) is the same math — FFTW replaces cuFFT, and CUDA kernels become regular
+C++ functions. The code actually gets simpler: no device/host memory split, no transfers,
+no stream synchronization.
+
+**Why it should be fast:** Python vhs-decode is bottlenecked by single-threaded CPython
+and GIL contention, not the algorithms. C++ eliminates both. A single C++ thread could
+likely hit 15-30 FPS (vs Python's 2-8 FPS). With multi-core parallelism, much more.
+
+### Three parallelization approaches
+
+**Option A: Batched (same model as GPU)**
+
 ```
+Batch 1: [field 0..15] → 16 threads, each decodes one field → write TBC → next batch
+Batch 2: [field 16..31] → same
+```
+
+Direct port of the current GPU architecture. Good cache locality, chroma state carries
+forward naturally between batches. Downside: threads synchronize at batch boundaries
+(fastest thread waits for slowest).
+
+**Option B: File segmentation (N independent pipelines)**
+
+```
+Thread 0: fields 0..26,000      (serial within segment)
+Thread 1: fields 26,001..52,000 (serial within segment)
+...etc
+```
+
+Each thread is fully independent — zero synchronization during processing. Downsides:
+chroma state at segment boundaries is unknown (cold start, first few fields may be wrong),
+TBC output needs coordination (N temp files or preallocated regions), uneven segments if
+field density varies (tape edits, blank sections).
+
+**Option C: Work queue (best of both)**
+
+```
+Work queue: [field 0, field 1, field 2, ...]
+16 threads each grab next available field, decode it, write it
+```
+
+No batch synchronization — threads never wait for each other. Better load balancing than
+fixed segments (slow fields don't block others). Each field's TBC output position is known
+ahead of time, so writes don't conflict. Chroma track detection needs a small serial fixup
+pass after all per-field metrics are computed (same approach as the GPU `k_find_first_bad`
+kernel).
+
+**Why Option C is probably the best choice:** Batching exists on the GPU to amortize kernel
+launch overhead and maximize occupancy. On CPU there's no kernel launch cost, so the
+batching constraint goes away. A simple thread pool with a work queue is both simpler and
+more efficient.
+
+### Rough performance estimates (C++ with OpenMP)
+
+| CPU class | Cores | Est. single-thread FPS | Est. parallel FPS |
+|-----------|-------|------------------------|--------------------|
+| Mid-range (6C/12T) | 6 | 15-30 | 60-120 |
+| Good (8C/16T) | 8 | 15-30 | 80-160 |
+| Elite (16C/32T) | 16 | 15-30 | 150-300+ |
+| Apple Silicon (M3 Pro+) | 10-12 | 20-40 | 150-300+ |
+
+These are speculative but grounded: each field is ~468K samples through an FFT and filters.
+FFTW on a modern x86 core handles that in single-digit milliseconds. Fields are
+embarrassingly parallel — zero data dependency between them.
+
+---
+
+## TBC Export Profile Comparison (2026-03-25)
+
+Benchmarked `tbc-video-export` profiles on a 30-second sample (900 frames) from a 2-hour
+NTSC VHS capture decoded by cuVHS. Source: `TAPE_1_cuVHS.tbc` (430,150 fields).
+
+All exports used default settings for each profile (no manual CRF/preset tuning).
+System: RTX 3090, 32 GB RAM, Ubuntu 6.17.0.
+
+### Results
+
+| Profile | Codec | Pixel Format | 30s Size | Encode FPS | Encode Time | Est. 2hr Size | Est. 2hr Time |
+|---------|-------|-------------|----------|------------|-------------|---------------|---------------|
+| `--ffv1` (default) | FFV1 | yuv422p10le | 407 MB | 44 fps | 25s | ~97 GB | ~81 min |
+| `--ffv1 --8bit` | FFV1 | yuv422p | 287 MB | 95 fps | 12s | ~69 GB | ~38 min |
+| `--x264` | H.264 | yuv422p | 37 MB | 31 fps | 31s | ~9 GB | ~116 min |
+| `--x265` | H.265/HEVC | yuv422p | 11 MB | 37 fps | 27s | ~2.6 GB | ~97 min |
+
+### Notes
+
+- **FFV1 10-bit** is the vhs-decode community standard for archival. Mathematically lossless.
+- **FFV1 8-bit** is also lossless at 8-bit precision, but truncates the bottom 2 bits from
+  the 16-bit TBC data. For VHS content the SNR doesn't meaningfully carry 10 bits, so the
+  quality difference is negligible. 2x faster encode, 30% smaller files.
+- **H.264** is lossy but visually transparent at the default quality settings. Massive size
+  reduction (11x vs FFV1 8-bit). Surprisingly the slowest encode — likely due to the default
+  preset/CRF tbc-video-export uses.
+- **H.265** is lossy, even smaller (3.4x vs H.264). Faster to encode than H.264 here, which
+  is unusual — H.265 is normally slower. Again likely down to default preset differences.
+
+### Full 2-hour export (FFV1 10-bit default)
+
+```
+Input:    TAPE_1_cuVHS.tbc (430,150 fields, 215,075 frames)
+Profile:  ffv1 (yuv422p10le)
+Output:   92.41 GB, 01:59:36, 110607 kbits/s
+Time:     58 min 5 sec (62 fps encode)
+Dropout concealments: 0 (cuVHS dropout detection not producing metadata — see investigation below)
+```
+
+The 30s sample estimated ~97 GB; actual came in at 92.41 GB. Encode ran at 62 fps (vs 44 fps
+on the 30s sample — likely better throughput once ffmpeg's pipeline is saturated).
+
+### Recommendation
+
+- **Archival:** FFV1 10-bit (default). Keep the full TBC data intact.
+- **Working copy / space-constrained archival:** FFV1 8-bit. Best speed, reasonable size.
+- **Viewing / sharing:** H.264 or H.265. Tiny files, good enough for VHS content.
+
+## isFirstField Detection Fix (2025-03-25)
+
+### Problem
+
+Tape transitions (edit points) cause total breakdown of the output video — image tears,
+sync loss, and phase errors for everything after the transition. On a 2-hour capture,
+the transition at ~1:15:55 corrupted the entire remaining ~45 minutes.
+
+`tbc-video-export` reported 92 instances of "Both of the determined fields have
+isFirstField set", confirming the field parity metadata was wrong.
+
+### Root Cause
+
+Field parity was assigned naively in `pipeline.cu`:
+```cpp
+writer.set_first_field(i % 2 == 0);  // BUG: assumes perfect alternation
+```
+
+This breaks at tape edit points where the VCR may drop or insert a field, shifting
+the even/odd cadence. Everything after the glitch gets the wrong field parity, causing
+tbc-video-export to interleave fields incorrectly.
+
+### Fix (two parts)
+
+**Part 1: VSYNC-based parity detection in K3 (`line_locs.cu`)**
+
+Detect field parity from the VSYNC pulse pattern, matching Python vhs-decode (`sync.pyx`).
+In NTSC interlaced video, first vs second field is determined by pulse spacing at the
+vblank boundary:
+
+- **Entry spacing** (primary): last HSYNC before vblank → first EQ1 pulse.
+  First field ≈ 1.0 line, second field ≈ 0.5 lines.
+- **Exit spacing** (fallback): last EQ2 pulse → first HSYNC after vblank.
+  Same threshold (0.75 lines). Used when entry measurement is unavailable
+  (e.g., vblank starts before scan window).
+
+Added `int* d_is_first_field` output array to `line_locs()`. Returns 1 (first),
+0 (second), or -1 (unknown — no valid VSYNC sequence found).
+
+**Part 2: Alternation enforcement in `pipeline.cu`**
+
+VSYNC-based detection can be confidently *wrong* in garbage/transition zones.
+Two consecutive fields can never have the same parity in valid interlaced video.
+The pipeline enforces strict alternation:
+
+- If detection agrees with alternation (opposite of previous field): trust it.
+- If detection conflicts OR is unknown: force alternation.
+
+Detection is only useful for establishing *initial* parity or correcting after a
+genuine field drop/insert at a tape edit point. It cannot override alternation.
+
+### Result (partial)
+
+Initial test on the 5-minute transition clip: zero "isFirstField" errors from
+tbc-video-export (was 92). But video after the tape edit still stutters badly —
+parity detection returns "unknown" for ~80% of post-transition fields, and the
+few it detects are all classified as second-field.
+
+### Second Root Cause: Fixed Pulse Width Thresholds
+
+Diagnosis via pulse width dump revealed the real problem. The two recordings
+on the tape have different pulse timing:
+
+| Pulse type | Recording 1 (samples) | Recording 2 (samples) | K3 threshold range |
+|------------|----------------------|----------------------|-------------------|
+| EQ         | ~65                  | 79–84                | 50–78             |
+| HSYNC      | ~132                 | 145–153              | 118–146           |
+| VSYNC      | ~759                 | 784–791              | 379–787           |
+
+Recording 2's EQ pulses (79–84) fall in the gap between EQ max (78) and HSYNC
+min (118), so they default to HSYNC. Result: `eq=0-5` instead of `eq=24` per
+field, state machine can't find HSYNC→EQ1 transition, parity = unknown.
+
+This is expected — different VCRs, recording speeds, or tape wear produce
+different absolute pulse widths. Python vhs-decode handles this with adaptive
+thresholds (`core.py:get_timings()`):
+
+1. Generous first pass to find HSYNC-like pulses (±1.75µs window)
+2. Take the **median** width → `hsync_median`
+3. Compute offset from nominal: `hsync_offset = hsync_median - hsync_typical`
+4. Shift **all** classification ranges (EQ, HSYNC, VSYNC) by that offset
+
+### Fix: Adaptive Pulse Classification in K3
+
+Implementing the same approach in `k_compute_linelocs` Phase 2 (one thread per
+field, sequential scan). Before running the state machine:
+
+1. Scan all pulse lengths, collect those within a generous HSYNC-like range
+2. Compute mean (cheaper than median on GPU, close enough)
+3. Derive offset from nominal HSYNC width
+4. Re-classify pulses with shifted thresholds for this field
+
+Cost: one extra linear scan over ~295 pulses per field — negligible.
+
+### Result
+
+**Fixed.** Tested on 5-minute clip spanning tape transition at 1:15:55 (two different
+recordings spliced on the same VHS tape, with 3-4 seconds of garbage between them):
+
+| Metric                          | Before (naive `i%2`) | After (adaptive) |
+|---------------------------------|---------------------|------------------|
+| Same-parity violations (total)  | 415                 | 92               |
+| Pre-transition violations       | 0                   | 0                |
+| Transition garbage zone         | n/a                 | 88               |
+| Post-transition clean video     | hundreds            | 4                |
+| tbc-video-export errors         | 92 "Both fields"    | 0                |
+| tbc-video-export result         | broken/unwatchable  | clean export     |
+
+The 88 violations in the transition zone are the actual 3-4 seconds of tape noise/garbage
+visible on the original VHS — no valid video signal exists there.
+
+Performance unchanged: 92.4 FPS (was 90.4 FPS — within noise).

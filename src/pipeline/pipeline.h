@@ -57,8 +57,10 @@ private:
     void* d_pulse_count = nullptr;   // pulse count per field (batch ints)
     void* d_pulse_types = nullptr;   // pulse type classification (batch x MAX_PULSES ints)
     void* d_linelocs = nullptr;    // line locations (batch)
+    void* d_envelope = nullptr;    // RF envelope magnitude (float64, batch)
     void* d_tbc_luma = nullptr;    // TBC luma output (uint16, batch)
     void* d_tbc_chroma = nullptr;  // TBC chroma output (uint16, batch)
+    void* d_is_first_field = nullptr;  // field parity from VSYNC pulse pattern (int, batch)
 
     // Kernel 7: Dropout detection output (TBC-mapped dropout entries)
     void* d_do_lines = nullptr;    // dropout line indices (batch x MAX_DROPOUTS_PER_FIELD)

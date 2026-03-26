@@ -47,6 +47,7 @@ void fm_demod(FMDemodState& state,
               const double* d_raw,
               double* d_demod,
               double* d_demod_05,
+              double* d_envelope,  // RF envelope magnitude (nullptr to skip)
               int num_fields,
               size_t samples_per_field,
               const VideoFormat& fmt);

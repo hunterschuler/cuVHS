@@ -63,23 +63,76 @@ __global__ void k_compute_linelocs(
     const int* pulse_starts,        // [num_fields x MAX_PULSES]
     const int* pulse_lengths,       // [num_fields x MAX_PULSES]
     const int* pulse_count,         // [num_fields]
-    const int* pulse_types,         // [num_fields x MAX_PULSES]
+    const int* pulse_types_in,      // [num_fields x MAX_PULSES] Phase 1 nominal classification
     double* linelocs,               // [num_fields x lines_per_frame] output
+    int* is_first_field,            // [num_fields] output: 1=first, 0=second, -1=unknown
     int max_pulses,
     int num_fields,
     int lines_per_frame,
     int samples_per_line,           // nominal line length in samples
-    double hsync_min, double hsync_max)
+    double hsync_nominal,           // nominal HSYNC width in samples
+    double eq_nominal,              // nominal EQ width in samples
+    double vsync_nominal,           // nominal VSYNC width in samples
+    double tol_samples,             // ±0.5µs in samples
+    bool is_ntsc)
 {
     int field = blockIdx.x * blockDim.x + threadIdx.x;
     if (field >= num_fields) return;
 
-    const int* starts = pulse_starts + field * max_pulses;
-    const int* types  = pulse_types  + field * max_pulses;
-    double* locs      = linelocs + field * lines_per_frame;
-    int npc           = pulse_count[field];
+    const int* starts  = pulse_starts + field * max_pulses;
+    const int* lengths = pulse_lengths + field * max_pulses;
+    double* locs       = linelocs + field * lines_per_frame;
+    int npc            = pulse_count[field];
 
-    double inlinelen  = (double)samples_per_line;
+    double inlinelen   = (double)samples_per_line;
+
+    // -----------------------------------------------------------------
+    // Step 0: Adaptive pulse classification
+    //
+    // Different VHS recordings have different absolute pulse widths.
+    // Measure median HSYNC width per field and shift all thresholds.
+    // Matches Python vhs-decode core.py get_timings().
+    // -----------------------------------------------------------------
+
+    // Generous first pass: find HSYNC-like pulses (±1.75µs / +2µs, matching Python)
+    double generous_hsync_min = hsync_nominal - 3.5 * tol_samples;  // -1.75µs
+    double generous_hsync_max = hsync_nominal + 4.0 * tol_samples;  // +2.0µs
+
+    double hsync_sum = 0.0;
+    int hsync_count = 0;
+    for (int i = 0; i < npc; i++) {
+        double len = (double)lengths[i];
+        if (len >= generous_hsync_min && len <= generous_hsync_max) {
+            hsync_sum += len;
+            hsync_count++;
+        }
+    }
+
+    double hsync_median_est = (hsync_count > 0) ? (hsync_sum / hsync_count) : hsync_nominal;
+    double hsync_offset = hsync_median_est - hsync_nominal;
+
+    double a_hsync_min = hsync_nominal + hsync_offset - tol_samples;
+    double a_hsync_max = hsync_nominal + hsync_offset + tol_samples;
+    double a_eq_min    = eq_nominal + hsync_offset - tol_samples;
+    double a_eq_max    = eq_nominal + hsync_offset + tol_samples;
+    double a_vsync_min = (vsync_nominal + hsync_offset) * 0.5;
+    double a_vsync_max = vsync_nominal + hsync_offset + 2.0 * tol_samples;
+
+    int local_types[800];
+    int npc_clamped = (npc < 800) ? npc : 800;
+    for (int i = 0; i < npc_clamped; i++) {
+        double len = (double)lengths[i];
+        if (len >= a_vsync_min && len <= a_vsync_max) {
+            local_types[i] = PULSE_VSYNC;
+        } else if (len >= a_hsync_min && len <= a_hsync_max) {
+            local_types[i] = PULSE_HSYNC;
+        } else if (len >= a_eq_min && len <= a_eq_max) {
+            local_types[i] = PULSE_EQ1;
+        } else {
+            local_types[i] = PULSE_HSYNC;
+        }
+    }
+    const int* types = local_types;
 
     // -----------------------------------------------------------------
     // Step 1: Run vblank state machine
@@ -87,22 +140,27 @@ __global__ void k_compute_linelocs(
     // Simplified version of Python run_vblank_state_machine():
     // Track state transitions: HSYNC -> EQ1 -> VSYNC -> EQ2 -> HSYNC
     // Record the index of the first HSYNC after the first EQ2 section.
+    // Also track last_hsync_idx and first_eq1_idx for parity detection.
     // -----------------------------------------------------------------
 
     int ref_pulse_idx = -1;     // first HSYNC after VSYNC/EQ2
+    int last_hsync_idx = -1;    // last HSYNC before EQ1 section
+    int first_eq1_idx = -1;     // first EQ1 pulse in vblank
+    int last_eq2_idx = -1;      // last EQ2 pulse before ref HSYNC (for exit spacing)
     int state = -1;             // -1 = initial
 
-    for (int i = 0; i < npc; i++) {
+    for (int i = 0; i < npc_clamped; i++) {
         int t = types[i];
 
         if (state == -1) {
             // Need a HSYNC to start
-            if (t == PULSE_HSYNC) state = PULSE_HSYNC;
+            if (t == PULSE_HSYNC) { state = PULSE_HSYNC; last_hsync_idx = i; }
         } else if (state == PULSE_HSYNC) {
             if (t == PULSE_HSYNC) {
-                // stay
+                last_hsync_idx = i;
             } else if (t == PULSE_EQ1) {
                 state = PULSE_EQ1;
+                first_eq1_idx = i;
             } else if (t == PULSE_VSYNC) {
                 state = PULSE_VSYNC;
             }
@@ -114,6 +172,8 @@ __global__ void k_compute_linelocs(
             } else if (t == PULSE_HSYNC) {
                 // false alarm, back to HSYNC
                 state = PULSE_HSYNC;
+                last_hsync_idx = i;
+                first_eq1_idx = -1;
             }
         } else if (state == PULSE_VSYNC) {
             if (t == PULSE_VSYNC) {
@@ -121,6 +181,7 @@ __global__ void k_compute_linelocs(
             } else if (t == PULSE_EQ1) {
                 // VSYNC -> EQ2 transition
                 state = PULSE_EQ2;
+                last_eq2_idx = i;
             } else if (t == PULSE_HSYNC) {
                 // Direct VSYNC -> HSYNC (unusual, but accept it)
                 ref_pulse_idx = i;
@@ -129,13 +190,49 @@ __global__ void k_compute_linelocs(
         } else if (state == PULSE_EQ2) {
             if (t == PULSE_EQ1) {
                 // stay in EQ2
+                last_eq2_idx = i;
             } else if (t == PULSE_HSYNC) {
                 // Found the reference pulse
+                if (last_eq2_idx < 0) last_eq2_idx = i - 1;  // fallback
                 ref_pulse_idx = i;
                 break;
             }
         }
     }
+
+    // -----------------------------------------------------------------
+    // Step 1b: Field parity detection from VSYNC pulse pattern
+    //
+    // NTSC first field: HSYNC→EQ1 spacing ≈ 1.0 line
+    // NTSC second field: HSYNC→EQ1 spacing ≈ 0.5 lines
+    // Only trust when full vblank was found (ref_pulse_idx >= 0).
+    // -----------------------------------------------------------------
+
+    int field_parity = -1;  // -1 = unknown
+
+    // Try entry spacing first: last HSYNC before vblank → first EQ1
+    if (ref_pulse_idx >= 0 && last_hsync_idx >= 0 && first_eq1_idx >= 0) {
+        double entry_spacing = (double)(starts[first_eq1_idx] - starts[last_hsync_idx]);
+        double entry_lines = entry_spacing / inlinelen;
+        if (is_ntsc) {
+            field_parity = (entry_lines > 0.75) ? 1 : 0;  // 1=first, 0=second
+        } else {
+            field_parity = (entry_lines > 0.75) ? 0 : 1;
+        }
+    }
+
+    // Fallback: exit spacing — last EQ2 pulse → first HSYNC after vblank
+    if (field_parity < 0 && ref_pulse_idx >= 0 && last_eq2_idx >= 0) {
+        double exit_spacing = (double)(starts[ref_pulse_idx] - starts[last_eq2_idx]);
+        double exit_lines = exit_spacing / inlinelen;
+        if (is_ntsc) {
+            field_parity = (exit_lines > 0.75) ? 1 : 0;
+        } else {
+            field_parity = (exit_lines > 0.75) ? 0 : 1;
+        }
+    }
+
+    is_first_field[field] = field_parity;
 
     // -----------------------------------------------------------------
     // Step 2: Compute mean line length from longest HSYNC run
@@ -148,7 +245,7 @@ __global__ void k_compute_linelocs(
     int best_run_start = -1, best_run_len = 0;
     int cur_run_start = -1, cur_run_len = 0;
 
-    for (int i = 0; i < npc; i++) {
+    for (int i = 0; i < npc_clamped; i++) {
         if (types[i] == PULSE_HSYNC) {
             if (cur_run_start == -1) {
                 cur_run_start = i;
@@ -224,7 +321,7 @@ __global__ void k_compute_linelocs(
         // No VSYNC found: use first HSYNC pulse as a rough reference
         // Find the first HSYNC
         ref_pulse_idx = 0;
-        for (int i = 0; i < npc; i++) {
+        for (int i = 0; i < npc_clamped; i++) {
             if (types[i] == PULSE_HSYNC) {
                 ref_pulse_idx = i;
                 break;
@@ -249,7 +346,7 @@ __global__ void k_compute_linelocs(
     // (skip EQ/VSYNC pulses since they're at half-line intervals)
     int hsync_starts[800];  // local array — fits in registers/local mem
     int num_hsyncs = 0;
-    for (int i = 0; i < npc && num_hsyncs < 800; i++) {
+    for (int i = 0; i < npc_clamped && num_hsyncs < 800; i++) {
         if (types[i] == PULSE_HSYNC) {
             hsync_starts[num_hsyncs++] = starts[i];
         }
@@ -304,6 +401,7 @@ void line_locs(const int* d_pulse_starts,
                const int* d_pulse_count,
                int* d_pulse_types,
                double* d_linelocs,
+               int* d_is_first_field,
                int num_fields,
                const VideoFormat& fmt)
 {
@@ -331,15 +429,17 @@ void line_locs(const int* d_pulse_starts,
             vsync_min, vsync_max);
     }
 
-    // Phase 2+3: per-field state machine + mean linelen + line assignment
+    // Phase 2+3: per-field adaptive classification + state machine + line assignment
     {
         int threads = 256;
         int blocks = (num_fields + threads - 1) / threads;
         k_compute_linelocs<<<blocks, threads>>>(
             d_pulse_starts, d_pulse_lengths, d_pulse_count,
-            d_pulse_types, d_linelocs,
+            d_pulse_types, d_linelocs, d_is_first_field,
             MAX_PULSES, num_fields,
             fmt.lines_per_frame, fmt.samples_per_line,
-            hsync_min, hsync_max);
+            fmt.hsync_width, fmt.eq_pulse_width, fmt.vsync_width,
+            tol_samples,
+            fmt.system == VideoSystem::NTSC);
     }
 }

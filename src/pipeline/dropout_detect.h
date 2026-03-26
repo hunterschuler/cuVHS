@@ -19,7 +19,7 @@
 //
 // Output: per-field arrays of (line, startx, endx) dropout entries,
 // downloaded to host and passed to TBCWriter for JSON metadata.
-void dropout_detect(const double* d_raw,
+void dropout_detect(const double* d_envelope,
                     const double* d_linelocs,
                     uint16_t* d_tbc_luma,
                     uint16_t* d_tbc_chroma,
