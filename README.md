@@ -19,7 +19,7 @@ The output is a pair of `.tbc` files (luma + chroma) plus a `.tbc.json` metadata
 
 ## Performance
 
-~85 FPS on an RTX 3090 (~14x real-time NTSC).
+~85 FPS on an RTX 3090.
 
 ## Requirements
 
