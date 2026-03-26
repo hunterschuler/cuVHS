@@ -1618,4 +1618,15 @@ recordings spliced on the same VHS tape, with 3-4 seconds of garbage between the
 The 88 violations in the transition zone are the actual 3-4 seconds of tape noise/garbage
 visible on the original VHS — no valid video signal exists there.
 
+## A100 Benchmark + Remove Batch Size Cap (2026-03-25)
+
+Tested on NVIDIA A100-SXM4-80GB: **101 FPS** (~3.4x real-time NTSC) on a 5-minute clip.
+About 20% faster than RTX 3090 (85 FPS), likely from the A100's higher memory bandwidth
+(2 TB/s vs 936 GB/s). Prescan was slower (53s vs 12s) due to weaker single-threaded CPU
+on the cluster node and network filesystem latency.
+
+Batch size was capped at 512 by a hardcoded limit, leaving 55 GB of the A100's 80 GB VRAM
+unused. Removed the cap — the VRAM budget (`gpu.max_batch_size()` at 80% of free VRAM)
+is the real constraint. Stream mode retains a 64-field cap for latency.
+
 Performance unchanged: 92.4 FPS (was 90.4 FPS — within noise).

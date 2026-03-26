@@ -108,10 +108,8 @@ bool Pipeline::allocate_buffers() {
     batch_size = gpu.max_batch_size(bytes_per_field(), 0.8);
 
     // In stream mode, use smaller batches for lower latency
-    int max_batch = reader.is_stream() ? 64 : 512;
-
+    if (reader.is_stream() && batch_size > 64) batch_size = 64;
     if (batch_size < 1) batch_size = 1;
-    if (batch_size > max_batch) batch_size = max_batch;
 
     fprintf(stderr, "Batch size: %d fields (%.1f MB per field, %.1f MB total)%s\n",
             batch_size,
