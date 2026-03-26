@@ -59,4 +59,6 @@ tbc-video-export tape_output tape_output.mkv
 
 ## License
 
-TBD
+BSD 3-Clause. See [LICENSE](LICENSE).
+
+If you use cuVHS in published work, please cite this repository. See [CITATION.cff](CITATION.cff).

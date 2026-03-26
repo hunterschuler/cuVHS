@@ -1,0 +1,9 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "cuVHS"
+authors:
+  - family-names: Schuler
+    given-names: Hunter
+type: software
+url: "https://github.com/hunterschuler/cuVHS"
+license: BSD-3-Clause
