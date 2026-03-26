@@ -674,6 +674,9 @@ bool Pipeline::run() {
 
         total_fields += processed;
 
+        // Write JSON after each batch so partial results are usable if we crash/get killed
+        writer.write_json();
+
         // Progress dashboard (two lines, rewritten in-place)
         auto now = std::chrono::steady_clock::now();
         double elapsed = std::chrono::duration<double>(now - t_start).count();

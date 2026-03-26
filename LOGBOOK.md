@@ -1629,8 +1629,35 @@ Batch size was capped at 512 by a hardcoded limit, leaving 55 GB of the A100's 8
 unused. Removed the cap — the VRAM budget (`gpu.max_batch_size()` at 80% of free VRAM)
 is the real constraint. Stream mode retains a 64-field cap for latency.
 
-Second run after cap removal: **133.5 FPS** (~4.5x real-time NTSC) with batch size 1372,
-using ~59 GB VRAM. The larger batches let cuFFT amortize plan overhead across more fields.
+### Performance scaling with VRAM utilization
+
+| Run | VRAM ceiling | Batch size | VRAM used | FPS   | Real-time |
+|-----|-------------|------------|-----------|-------|-----------|
+| 1   | 80% (capped 512) | 512   | ~24 GB    | 101   | 3.4x      |
+| 2   | 80% (uncapped)   | 1372  | ~59 GB    | 133.5 | 4.5x      |
+| 3   | 95% (try-and-backoff) | 1629 | ~76 GB | 137.6 | 4.6x      |
+
+Bigger batches help — going from 512→1372 (2.7x more fields) gave 32% more FPS. But
+1372→1629 (only 19% more fields) gave just 3% more FPS, suggesting we're approaching a
+throughput ceiling where memory bandwidth or compute saturation dominates over batch
+overhead. The A100's 108 SMs are likely near full utilization at batch ~1400.
+
+This is good news for consumer GPUs: an RTX 3080 (10 GB) fitting ~180 fields per batch
+should still land in the efficient region of the curve. The per-field cost is mostly
+fixed (FFT, demod, sync detection) — batch size primarily affects plan setup amortization
+and kernel launch overhead, both of which flatten out quickly.
+
+### Multi-GPU future
+
+The pipeline is embarrassingly parallel at the field level — each field is independent
+after prescan. Multi-GPU support would split the field offset list across devices, each
+running its own batch loop. Main challenges: (1) prescan still runs on CPU, so it's
+shared; (2) TBC output must be written in field order, requiring a merge step or
+coordinated sequential writes; (3) chroma state (track, phase cycle) is carried across
+fields, so either one GPU leads chroma decisions or each GPU handles a contiguous
+segment. For a DGX with 8x A100s, even naive partitioning (split file into 8 segments)
+could theoretically approach 1000 FPS — though I/O would become the bottleneck long
+before that.
 
 VRAM allocation currently uses a fixed 80% ceiling — see next entry.
 
@@ -1649,3 +1676,68 @@ batch. The try-and-backoff approach discovers the real limit empirically.
 fraction of total). If it fails, the user sees a one-line "backing off" message and the
 next attempt runs immediately. Worst case is ~10 failed attempts (~1 second of startup)
 before settling at 50%.
+
+## Incremental JSON Metadata Writes (2026-03-25)
+
+Previously, `.tbc.json` was only written at the very end of the decode in `finalize()`.
+If the process was killed mid-decode (ctrl+C, OOM, crash), the TBC files existed on disk
+but the JSON metadata was lost entirely — making the TBC files useless to ld-tools.
+
+Now `write_json()` is called after every batch. It writes to a `.tmp` file then does an
+atomic `rename()`, so the JSON on disk is always complete and valid — never truncated.
+`finalize()` still does the final write + flushes the TBC streams.
+
+The field metadata vector (`field_meta`) still grows in memory for the full decode. For a
+6-hour tape (~3.4M fields) this is maybe 100-200 MB — not a problem in practice, but
+worth noting. A future optimization could switch to append-based JSON writing to cap
+memory usage, but that would require either a streaming JSON format or rewriting the
+`fields` array structure.
+
+## Future: GPU-Resident Encode Pipeline (planned)
+
+Goal: eliminate the ld-tools CPU chain and TBC-as-bottleneck entirely. Go from raw RF
+capture to encoded video in a single pass, all on GPU.
+
+### Current workflow (decode → export)
+
+```
+raw u8 → [GPU decode] → TBC on disk → ld-dropout-correct → ld-chroma-decoder → ffmpeg → video
+                         ^^^^^^^^^^^^   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                         ~100+ GB I/O   CPU-bound, multiple piped processes
+```
+
+### Planned workflow
+
+```
+raw u8 → [GPU decode] → [GPU dropout correct] → [GPU frame assembly] → [NVENC] → video
+              │
+              └──async──→ [CPU thread: TBC to disk] (background, optional)
+```
+
+Everything stays in VRAM between stages. NVENC is dedicated silicon on the die — doesn't
+compete with CUDA cores, so it runs in parallel with the next batch's decode. The TBC
+write happens via `cudaMemcpyAsync` to a host buffer + a background CPU writer thread.
+
+### What needs to be built
+
+1. **GPU dropout correction** — we already detect dropouts; correction (interpolate from
+   adjacent lines/fields) is a straightforward kernel.
+2. **GPU frame assembly** — interleave two fields into one frame using parity metadata we
+   already compute. Simple copy/interleave kernel.
+3. **NVENC integration** — NVIDIA Video Codec SDK, feed device pointers directly to the
+   encoder. No host roundtrip.
+4. **Async TBC writer** — background thread with a small ring buffer of host-pinned
+   memory. Fire-and-forget, won't stall the GPU unless disk is catastrophically slow.
+
+### Expected performance
+
+NVENC can encode 1080i H.264/H.265 at thousands of FPS — it won't be the bottleneck.
+The decode is the slowest stage (~137 FPS fields on A100, ~85 on 3090). So total
+throughput should be roughly equal to current decode FPS. A 6-hour tape in ~46 minutes
+on an A100, one command, no intermediate files.
+
+### Flags
+
+- Default: encode video + write TBC in background
+- `--no-tbc`: skip TBC write for max speed / slow storage
+- `--tbc-only`: current behavior, no encode (for ld-analyse users)

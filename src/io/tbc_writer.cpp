@@ -74,33 +74,24 @@ void TBCWriter::finish_field() {
     field_count++;
 }
 
-bool TBCWriter::finalize() {
-    // Flush TBC data
-    if (luma_fp) fflush(luma_fp);
-    if (chroma_fp) fflush(chroma_fp);
-
-    // Write JSON metadata (compatible with ld-tools)
-    FILE* fp = fopen(json_path.c_str(), "w");
+bool TBCWriter::write_json() {
+    // Write to a temp file, then atomic rename — so the JSON is never truncated on disk.
+    std::string tmp_path = json_path + ".tmp";
+    FILE* fp = fopen(tmp_path.c_str(), "w");
     if (!fp) {
-        perror(json_path.c_str());
+        perror(tmp_path.c_str());
         return false;
     }
 
     const char* sys_name = (fmt.system == VideoSystem::NTSC) ? "NTSC" : "PAL";
 
     // Compute ld-tools compatible metadata values
-    // black16bIre: uint16 value at 0 IRE (blanking level)
-    // white16bIre: uint16 value at 100 IRE (peak white)
-    // Formula: output = (ire_shifted * output_scale) + output_zero
-    //   where ire_shifted = ire - vsync_ire (shift so sync tip = 0)
     double black16b = (0.0 - fmt.vsync_ire) * fmt.output_scale + fmt.output_zero;
     double white16b = (100.0 - fmt.vsync_ire) * fmt.output_scale + fmt.output_zero;
 
-    // Burst and active video positions (in output samples)
     int burst_start = (int)(fmt.burst_start_us * 1e-6 * fmt.output_rate + 0.5);
     int burst_end   = (int)(fmt.burst_end_us * 1e-6 * fmt.output_rate + 0.5);
 
-    // Active video: ~9.4 µs to ~62.5 µs for NTSC (standard values from vhs-decode)
     int active_start = (fmt.system == VideoSystem::NTSC) ? 134 : 185;
     int active_end   = (fmt.system == VideoSystem::NTSC) ? 894 : 1107;
 
@@ -160,6 +151,22 @@ bool TBCWriter::finalize() {
     fprintf(fp, "}\n");
 
     fclose(fp);
-    fprintf(stderr, "Wrote %s (%d fields)\n", json_path.c_str(), field_count);
+
+    // Atomic rename — on POSIX this replaces the target in one operation
+    if (rename(tmp_path.c_str(), json_path.c_str()) != 0) {
+        perror("rename .tbc.json");
+        return false;
+    }
+
+    return true;
+}
+
+bool TBCWriter::finalize() {
+    if (luma_fp) fflush(luma_fp);
+    if (chroma_fp) fflush(chroma_fp);
+
+    if (!write_json()) return false;
+
+    fprintf(stderr, "\nWrote %s (%d fields)\n", json_path.c_str(), field_count);
     return true;
 }

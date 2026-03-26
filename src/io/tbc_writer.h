@@ -31,7 +31,11 @@ struct TBCWriter {
     // Advance to next field. Commits metadata for the current field.
     void finish_field();
 
-    // Finalize: write .tbc.json and close files.
+    // Write .tbc.json with all metadata accumulated so far.
+    // Safe to call repeatedly (writes to temp file, then atomic rename).
+    bool write_json();
+
+    // Finalize: flush TBC streams and write final .tbc.json.
     bool finalize();
 
     int fields_written() const { return field_count; }
