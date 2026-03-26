@@ -1741,3 +1741,41 @@ on an A100, one command, no intermediate files.
 - Default: encode video + write TBC in background
 - `--no-tbc`: skip TBC write for max speed / slow storage
 - `--tbc-only`: current behavior, no encode (for ld-analyse users)
+
+---
+
+## Prescan Chunk Overlap Bug (2026-03-26)
+
+### Symptom
+
+47 duplicate fields in the output — cuVHS produced 11109 fields vs vhs-decode's 11060
+for the same 3-minute clip. Visual comparison showed a backward time-jump at field 610:
+the video rewound ~47 fields and re-decoded content it had already output.
+
+### Root Cause
+
+The prescan reads the u8 file in 256 MB chunks, with each chunk overlapping the previous
+by `long_win` (50 fields / ~24M samples) so the sliding window has enough history. **Two
+bugs in the chunked scan:**
+
+1. **Double scan**: each chunk scanned all the way to `n_read` (which includes the overlap
+   tail), but the next chunk also scanned that same overlap region as its prefix. Every
+   type-A VSYNC in the overlap zone was detected twice.
+
+2. **Unsigned underflow in dedup**: the duplicate filter `(abs_pos - last_end) > spf/2`
+   used unsigned subtraction. When the next chunk re-scanned from a lower absolute
+   position than the previous chunk ended at, the subtraction wrapped to ~2^64 and the
+   filter passed. The guard was always true for duplicates instead of always false.
+
+### Fix
+
+1. Limit each chunk's scan loop to only its new samples (`scan_end_in_buf`), not the
+   overlap tail that exists purely for window context.
+2. Add `abs_pos > last_end` guard before the unsigned subtraction.
+
+### Result
+
+- 11062 prescan offsets → 11061 decoded fields (vs vhs-decode's 11060)
+- The 1-field difference is the field-0-at-offset-0 convention
+- Zero backward jumps, zero duplicate offsets
+- The field 608-612 time-travel glitch is eliminated

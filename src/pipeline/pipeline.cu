@@ -277,8 +277,16 @@ bool Pipeline::prescan_field_boundaries() {
             long_count = lw_actual;
         }
 
-        // Scan this chunk
-        for (size_t i = scan_start_in_buf; i < n_read; i++) {
+        // Scan only the NEW samples in this chunk (not the overlap tail, which
+        // will be scanned as the overlap prefix of the next chunk).
+        // For chunk 0: scan up to chunk_bytes (or n_read if file is smaller).
+        // For chunk N>0: scan from overlap to overlap + chunk_bytes.
+        size_t scan_end_in_buf = std::min(n_read,
+            (chunk_idx == 0) ? chunk_bytes : overlap + chunk_bytes);
+        // But don't exceed what we actually read
+        if (scan_end_in_buf > n_read) scan_end_in_buf = n_read;
+
+        for (size_t i = scan_start_in_buf; i < scan_end_in_buf; i++) {
             // Update short window
             short_sum += buf[i];
             short_sum -= buf[i - short_win];
@@ -300,7 +308,7 @@ bool Pipeline::prescan_field_boundaries() {
                 run_len++;
             } else {
                 if (run_len >= vsync_min_run) {
-                    if (type_a.empty() || (abs_pos - last_end) > spf / 2) {
+                    if (type_a.empty() || (abs_pos > last_end && (abs_pos - last_end) > spf / 2)) {
                         type_a.push_back(abs_pos);
                         last_end = abs_pos;
                     }
@@ -355,12 +363,29 @@ bool Pipeline::prescan_field_boundaries() {
     }
 
     // Fields 2+: for each consecutive pair of type-A VSYNCs,
-    // insert a type-B midpoint, then the next type-A
+    // determine how many fields fit in the gap and space them evenly.
+    //
+    // Normally type-A fields are ~2 field-spacings apart (every other VSYNC
+    // has a strong enough dip to detect). But gaps can vary:
+    //   ~1 field:  false type-A detection or both heads produced strong VSYNC
+    //              → no interpolation needed, just emit the next type-A
+    //   ~2 fields: normal case → insert one midpoint (type-B)
+    //   ~3 fields: one type-A was missed → insert two evenly-spaced fields
+    //   ~4 fields: two missed → insert three, etc.
+    //
+    // This prevents phantom fields (from ~1-field gaps with a midpoint shoved in)
+    // and missed fields (from ~4-field gaps with only one midpoint).
     for (size_t i = 1; i < type_a.size(); i++) {
-        // Type-B: midpoint between type_a[i-1] and type_a[i]
-        size_t midpoint = (type_a[i - 1] + type_a[i]) / 2;
-        size_t b_start = (midpoint > backtrack) ? midpoint - backtrack : 0;
-        field_offsets.push_back(b_start);
+        size_t gap = type_a[i] - type_a[i - 1];
+        // How many fields fit in this gap? Round to nearest integer.
+        int n_fields = (int)((double)gap / spf + 0.5);
+        if (n_fields < 1) n_fields = 1;
+
+        // Insert (n_fields - 1) evenly-spaced intermediate fields, then the type-A
+        for (int k = 1; k < n_fields; k++) {
+            size_t interp = type_a[i - 1] + (size_t)((double)gap * k / n_fields);
+            field_offsets.push_back(interp);
+        }
 
         // Type-A: this VSYNC
         size_t a_start = (type_a[i] > backtrack) ? type_a[i] - backtrack : 0;
