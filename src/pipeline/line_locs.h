@@ -25,6 +25,20 @@ enum PulseType : int { PULSE_HSYNC = 0, PULSE_EQ1 = 1, PULSE_VSYNC = 2, PULSE_EQ
 // Output layout:
 //   d_linelocs[field * lines_per_frame + line] = sample position of line start
 //
+// Per-field debug info from K3 (only allocated when CUVHS_DUMP_FIELDS is set)
+struct K3Debug {
+    int npc;                // pulse count for this field
+    int ref_pulse_idx;      // which pulse the state machine selected as reference
+    double ref_position;    // sample position of reference pulse
+    double ref_line;        // 19.0 = VSYNC found, 0.0 = fallback
+    double meanlinelen;     // computed mean line length
+    int best_run_len;       // longest consecutive HSYNC run
+    int num_hsyncs;         // total HSYNC pulses after classification
+    double hsync_offset;    // adaptive classification shift from nominal
+    int final_state;        // state machine final state (-1, HSYNC, EQ1, VSYNC, EQ2)
+    int field_parity;       // 1=first, 0=second, -1=unknown
+};
+
 void line_locs(const int* d_pulse_starts,
                const int* d_pulse_lengths,
                const int* d_pulse_count,
@@ -32,4 +46,5 @@ void line_locs(const int* d_pulse_starts,
                double* d_linelocs,
                int* d_is_first_field,    // [num_fields] output: 1=first, 0=second, -1=unknown
                int num_fields,
-               const VideoFormat& fmt);
+               const VideoFormat& fmt,
+               K3Debug* d_k3_debug = nullptr);  // optional debug output

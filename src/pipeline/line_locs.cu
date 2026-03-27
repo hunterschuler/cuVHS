@@ -66,6 +66,7 @@ __global__ void k_compute_linelocs(
     const int* pulse_types_in,      // [num_fields x MAX_PULSES] Phase 1 nominal classification
     double* linelocs,               // [num_fields x lines_per_frame] output
     int* is_first_field,            // [num_fields] output: 1=first, 0=second, -1=unknown
+    K3Debug* k3_debug,              // [num_fields] optional debug output (may be nullptr)
     int max_pulses,
     int num_fields,
     int lines_per_frame,
@@ -74,6 +75,7 @@ __global__ void k_compute_linelocs(
     double eq_nominal,              // nominal EQ width in samples
     double vsync_nominal,           // nominal VSYNC width in samples
     double tol_samples,             // ±0.5µs in samples
+    int samples_per_field,          // approximate samples in one field
     bool is_ntsc)
 {
     int field = blockIdx.x * blockDim.x + threadIdx.x;
@@ -299,24 +301,25 @@ __global__ void k_compute_linelocs(
 
     if (ref_pulse_idx >= 0) {
         ref_position = (double)starts[ref_pulse_idx];
-        // The reference pulse is the first HSYNC after vblank.
-        // For NTSC: this is approximately line 10 (3 EQ sections × 3 lines each + 1)
-        // For PAL: approximately line 8
-        // Use num_eq_pulses to compute: 3 sections × (num_eq/2) half-lines ≈
-        //   num_eq * 1.5 lines, plus some offsets
-        // Simplified: count from 0, treating ref as the first active video line.
-        // We'll number lines starting from line 0 = last HSYNC of previous field.
-        // The reference is at hsync_start_line.
-        // The reference pulse is the first HSYNC after vblank (after EQ2 section).
-        // NTSC vblank structure: 6 EQ1 pulses (3H) + 6 VSYNC (3H) + 6 EQ2 (3H) = 9H
-        // Plus firstFieldH gap (0.5H or 1H depending on field type).
-        // Python's getLine0() computes: line0 = firstloc - (eqgap + distfroml1) * inlinelen
-        // For EQ2 found first: distfroml1=6H, eqgap=0.5-1H → line0 is 6.5-7H before EQ2 start.
-        // EQ2 has 6 half-line pulses = 3H, so ref HSYNC is 9.5-10H from line 0.
-        // But Python also incorporates the second vblank (at field end) via median of 3 estimates.
-        // Empirically measured: cuVHS output is shifted 9 lines up vs Python.
-        // ref_line=19 aligns cuVHS line active_line_start(10) with Python's output start.
         ref_line = 19.0;
+
+        // If the state machine found a VSYNC late in the pulse list, it likely
+        // locked onto the NEXT field's VSYNC (at the end of this field's chunk)
+        // instead of THIS field's VSYNC (at the beginning). This happens when
+        // tape damage corrupts the leading sync pulses.
+        //
+        // Fix: subtract one field's worth of samples to project back to where
+        // this field's VSYNC should have been. Verified: this recovers the
+        // correct ref_position to within ~150 samples on known-bad fields.
+        if (ref_pulse_idx > npc_clamped / 2) {
+            double corrected = ref_position - (double)samples_per_field;
+            // Only apply if the corrected position is still positive —
+            // field 0 legitimately has its VSYNC in the middle of the chunk
+            // (it starts before the first VSYNC), so don't "correct" it.
+            if (corrected > 0.0) {
+                ref_position = corrected;
+            }
+        }
     } else {
         // No VSYNC found: use first HSYNC pulse as a rough reference
         // Find the first HSYNC
@@ -342,6 +345,21 @@ __global__ void k_compute_linelocs(
     // already are since K2 scans sequentially).
     // -----------------------------------------------------------------
 
+    // Write debug info if buffer provided
+    if (k3_debug) {
+        K3Debug& dbg = k3_debug[field];
+        dbg.npc = npc;
+        dbg.ref_pulse_idx = ref_pulse_idx;
+        dbg.ref_position = ref_position;
+        dbg.ref_line = ref_line;
+        dbg.meanlinelen = meanlinelen;
+        dbg.best_run_len = best_run_len;
+        dbg.hsync_offset = hsync_offset;
+        dbg.final_state = state;
+        dbg.field_parity = field_parity;
+        // num_hsyncs filled below
+    }
+
     // Build a compact list of HSYNC-only pulse starts for matching
     // (skip EQ/VSYNC pulses since they're at half-line intervals)
     int hsync_starts[800];  // local array — fits in registers/local mem
@@ -351,6 +369,8 @@ __global__ void k_compute_linelocs(
             hsync_starts[num_hsyncs++] = starts[i];
         }
     }
+
+    if (k3_debug) k3_debug[field].num_hsyncs = num_hsyncs;
 
     double max_allowed_distance = meanlinelen / 1.5;
     int cur_hsync = 0;  // monotonic cursor into hsync_starts
@@ -403,7 +423,8 @@ void line_locs(const int* d_pulse_starts,
                double* d_linelocs,
                int* d_is_first_field,
                int num_fields,
-               const VideoFormat& fmt)
+               const VideoFormat& fmt,
+               K3Debug* d_k3_debug)
 {
     // Compute classification thresholds (in samples)
     // Tolerance: ±0.5 µs for HSYNC and EQ, wider range for VSYNC
@@ -436,10 +457,12 @@ void line_locs(const int* d_pulse_starts,
         k_compute_linelocs<<<blocks, threads>>>(
             d_pulse_starts, d_pulse_lengths, d_pulse_count,
             d_pulse_types, d_linelocs, d_is_first_field,
+            d_k3_debug,
             MAX_PULSES, num_fields,
             fmt.lines_per_frame, fmt.samples_per_line,
             fmt.hsync_width, fmt.eq_pulse_width, fmt.vsync_width,
             tol_samples,
+            fmt.samples_per_field,
             fmt.system == VideoSystem::NTSC);
     }
 }

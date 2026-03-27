@@ -3,6 +3,7 @@
 #include "pipeline/sync_pulses.h"
 #include "pipeline/line_locs.h"
 #include "pipeline/hsync_refine.h"
+#include "pipeline/lineloc_coherence.h"
 #include "pipeline/tbc_resample.h"
 #include "pipeline/chroma_decode.h"
 #include "pipeline/dropout_detect.h"
@@ -519,13 +520,41 @@ int Pipeline::process_batch(int start_field, int num_fields) {
     }
 
     // 5. Classify Pulses + Line Locations (Kernel 3)
+    K3Debug* d_k3_debug = nullptr;
+    {
+        static auto dump_fields = get_dump_fields();
+        if (!dump_fields.empty()) {
+            cudaMalloc(&d_k3_debug, fields_loaded * sizeof(K3Debug));
+            cudaMemset(d_k3_debug, 0, fields_loaded * sizeof(K3Debug));
+        }
+    }
     line_locs(static_cast<int*>(d_pulse_starts),
               static_cast<int*>(d_pulse_lengths),
               static_cast<int*>(d_pulse_count),
               static_cast<int*>(d_pulse_types),
               static_cast<double*>(d_linelocs),
               static_cast<int*>(d_is_first_field),
-              fields_loaded, fmt);
+              fields_loaded, fmt, d_k3_debug);
+
+    // --- Debug: dump K3 decisions for target fields ---
+    if (d_k3_debug) {
+        static auto dump_fields = get_dump_fields();
+        auto* h_dbg = new K3Debug[fields_loaded];
+        cudaMemcpy(h_dbg, d_k3_debug, fields_loaded * sizeof(K3Debug), cudaMemcpyDeviceToHost);
+        for (int df : dump_fields) {
+            int local_idx = df - start_field;
+            if (local_idx >= 0 && local_idx < fields_loaded) {
+                const K3Debug& d = h_dbg[local_idx];
+                fprintf(stderr, "  [K3 debug] field %d: npc=%d ref_idx=%d ref_pos=%.1f ref_line=%.1f "
+                        "meanll=%.2f best_run=%d num_hsyncs=%d hsync_off=%.2f state=%d parity=%d\n",
+                        df, d.npc, d.ref_pulse_idx, d.ref_position, d.ref_line,
+                        d.meanlinelen, d.best_run_len, d.num_hsyncs, d.hsync_offset,
+                        d.final_state, d.field_parity);
+            }
+        }
+        delete[] h_dbg;
+        cudaFree(d_k3_debug);
+    }
 
     // 6. Refine Line Locations via Hsync Zero-Crossing (Kernel 4)
     hsync_refine(static_cast<double*>(d_demod_05),

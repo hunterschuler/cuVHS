@@ -27,6 +27,7 @@ add_executable(cuvhs
     src/pipeline/sync_pulses.cu
     src/pipeline/line_locs.cu
     src/pipeline/hsync_refine.cu
+    src/pipeline/lineloc_coherence.cu
     src/pipeline/tbc_resample.cu
     src/pipeline/chroma_decode.cu
     src/pipeline/dropout_detect.cu

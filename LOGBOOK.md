@@ -1779,3 +1779,69 @@ bugs in the chunked scan:**
 - The 1-field difference is the field-0-at-offset-0 convention
 - Zero backward jumps, zero duplicate offsets
 - The field 608-612 time-travel glitch is eliminated
+
+---
+
+## K3 Wrong-VSYNC Fix: Tape Edit Tearing + Chroma Corruption (2026-03-26)
+
+### Symptom
+
+~200 fields near a tape edit (fields 5572-5776 in a 3-minute test clip) showed horizontal
+wrapping and vertical displacement in the TBC output. The image content was correct but
+positioned wrong — the entire field was shifted ~250 output samples horizontally. vhs-decode
+decoded the same region cleanly.
+
+A secondary symptom: when the fix was first applied without a guard, it corrupted field 0,
+which poisoned the chroma track detector's carried state and caused chroma to cycle in and
+out (greyscale dropout) across the entire file.
+
+### Root Cause
+
+K3's VSYNC state machine scans forward through the pulse list looking for the pattern
+EQ1→VSYNC→EQ2→HSYNC. Each field chunk contains two VSYNCs: this field's (near the start)
+and the next field's (near the end). Normally the state machine finds the first one at
+pulse ~20 and stops.
+
+Near tape edits, the leading sync pulses are corrupted — the EQ/VSYNC/EQ pattern doesn't
+match. The state machine walks right past the damaged first VSYNC, keeps scanning, and locks
+onto the **next field's** clean VSYNC near pulse ~280. It then lays out all 525 lines
+anchored from a reference point that's ~477K samples (one full field) too far into the chunk.
+
+Instrumented K3 output confirmed: good fields have `ref_pulse_idx ≈ 20`, bad fields have
+`ref_pulse_idx ≈ 280-290`. All other K3 outputs (meanlinelen, best_run_len, state) were
+identical between good and bad fields.
+
+### Fix
+
+In `k_compute_linelocs()`, after the state machine selects a reference pulse:
+
+```cpp
+if (ref_pulse_idx > npc_clamped / 2) {
+    double corrected = ref_position - (double)samples_per_field;
+    if (corrected > 0.0) {
+        ref_position = corrected;
+    }
+}
+```
+
+If the reference pulse is past the midpoint of the pulse list, it found the wrong VSYNC.
+Subtract `samples_per_field` to project back to the correct position. The `corrected > 0`
+guard prevents false correction on field 0, which legitimately has its VSYNC in the middle
+of the chunk (it starts before the first VSYNC in the file).
+
+### Why the guard matters
+
+Without the `corrected > 0` check, field 0 (which has `ref_pulse_idx ≈ 155` because the
+field starts before any VSYNC) gets a negative ref_position. This corrupts field 0's line
+positions, which causes the chroma track detector to misidentify the initial track. Since
+chroma state is carried across batches, the bad initial state propagates through the entire
+file, causing periodic chroma dropout.
+
+### Result
+
+- All ~200 previously-torn fields now decode with correct horizontal/vertical alignment
+- Chroma remains stable throughout (no greyscale cycling)
+- No measurable performance impact (the fix is 5 lines in a per-field kernel)
+- vhs-decode handles this differently: it validates each field against the previous one's
+  timing, which provides implicit temporal coherence. The K3 fix achieves the same result
+  without cross-field state, preserving full parallelism.
