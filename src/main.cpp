@@ -15,6 +15,7 @@ struct Args {
     VideoSystem system = VideoSystem::NTSC;
     double sample_rate_mhz = 28.0;
     InputFormat input_format = InputFormat::U8;
+    InputConditioning conditioning;
     bool format_explicit = false; // true if user specified --format
     int gpu_id = 0;              // -1 = auto-select best GPU
     bool overwrite = false;
@@ -33,7 +34,8 @@ static void print_usage(const char* prog) {
         "Options:\n"
         "  --system <NTSC|PAL>   Video system (default: NTSC)\n"
         "  -f <MHz>              Sample rate in MHz (default: 28)\n"
-        "  --format <u8|s16>     Input sample format (default: auto from extension)\n"
+        "  --format <u8|s16|u16> Input sample format (default: auto from extension)\n"
+        "  --dc-correct          Subtract per-read DC offset after normalization\n"
         "  --gpu <id>            GPU device ID, -1 for auto (default: 0)\n"
         "  --overwrite           Overwrite existing output files\n"
         "  -h, --help            Show this help\n",
@@ -58,7 +60,10 @@ static bool parse_args(int argc, char** argv, Args& args) {
             args.format_explicit = true;
             if (strcmp(argv[i], "u8") == 0) args.input_format = InputFormat::U8;
             else if (strcmp(argv[i], "s16") == 0) args.input_format = InputFormat::S16;
+            else if (strcmp(argv[i], "u16") == 0) args.input_format = InputFormat::U16;
             else { fprintf(stderr, "Unknown format: %s\n", argv[i]); return false; }
+        } else if (strcmp(argv[i], "--dc-correct") == 0) {
+            args.conditioning.dc_correct = true;
         } else if (strcmp(argv[i], "--gpu") == 0 && i + 1 < argc) {
             args.gpu_id = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--overwrite") == 0) {
@@ -112,28 +117,32 @@ int main(int argc, char** argv) {
 
     // Open input — stdin/pipe or file
     RawReader reader;
+    reader.set_conditioning(args.conditioning);
     bool is_stdin = (args.input_path == "-");
     if (is_stdin) {
         if (!reader.open_stdin(args.input_format)) {
             fprintf(stderr, "Failed to open stdin\n");
             return 1;
         }
-        fprintf(stderr, "Input: stdin (%.1f MHz, %s, streaming)\n",
-                args.sample_rate_mhz, input_format_name(args.input_format));
+        fprintf(stderr, "Input: stdin (%.1f MHz, %s, streaming%s)\n",
+                args.sample_rate_mhz, input_format_name(args.input_format),
+                args.conditioning.dc_correct ? ", dc-corrected" : "");
     } else {
         if (!reader.open(args.input_path, args.input_format)) {
             fprintf(stderr, "Failed to open input: %s\n", args.input_path.c_str());
             return 1;
         }
         if (reader.is_stream()) {
-            fprintf(stderr, "Input: %s (%.1f MHz, %s, streaming FIFO)\n",
-                    args.input_path.c_str(), args.sample_rate_mhz,
-                    input_format_name(args.input_format));
-        } else {
-            fprintf(stderr, "Input: %s (%.1f MHz, %s, %.2f GB)\n",
+            fprintf(stderr, "Input: %s (%.1f MHz, %s, streaming FIFO%s)\n",
                     args.input_path.c_str(), args.sample_rate_mhz,
                     input_format_name(args.input_format),
-                    reader.size_bytes() / (1024.0 * 1024.0 * 1024.0));
+                    args.conditioning.dc_correct ? ", dc-corrected" : "");
+        } else {
+            fprintf(stderr, "Input: %s (%.1f MHz, %s, %.2f GB%s)\n",
+                    args.input_path.c_str(), args.sample_rate_mhz,
+                    input_format_name(args.input_format),
+                    reader.size_bytes() / (1024.0 * 1024.0 * 1024.0),
+                    args.conditioning.dc_correct ? ", dc-corrected" : "");
         }
     }
 

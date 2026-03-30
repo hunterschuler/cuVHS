@@ -73,7 +73,7 @@ void RawReader::convert(const void* buf, double* dest, size_t num_samples) const
         case InputFormat::U8: {
             auto* src = static_cast<const uint8_t*>(buf);
             for (size_t i = 0; i < num_samples; i++)
-                dest[i] = static_cast<double>(src[i]);
+                dest[i] = (static_cast<double>(src[i]) - 128.0) * 256.0;
             break;
         }
         case InputFormat::S16: {
@@ -88,6 +88,15 @@ void RawReader::convert(const void* buf, double* dest, size_t num_samples) const
                 dest[i] = static_cast<double>(src[i]) - 32768.0;
             break;
         }
+    }
+
+    if (conditioning.dc_correct && num_samples > 0) {
+        double sum = 0.0;
+        for (size_t i = 0; i < num_samples; i++)
+            sum += dest[i];
+        double mean = sum / static_cast<double>(num_samples);
+        for (size_t i = 0; i < num_samples; i++)
+            dest[i] -= mean;
     }
 }
 

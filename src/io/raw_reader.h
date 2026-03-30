@@ -18,8 +18,15 @@
 //   s16: passthrough
 //   u16: (sample - 32768)
 //
+struct InputConditioning {
+    bool dc_correct = false;  // subtract per-read mean after bit-depth normalization
+};
+
 struct RawReader {
     ~RawReader();
+
+    void set_conditioning(const InputConditioning& cfg) { conditioning = cfg; }
+    InputConditioning get_conditioning() const { return conditioning; }
 
     // File mode: open a regular file by path.
     bool open(const std::string& path, InputFormat fmt);
@@ -69,6 +76,7 @@ private:
     bool owns_fd = false;        // true if we opened it, false if caller owns it
     bool streaming = false;
     InputFormat fmt = InputFormat::U8;
+    InputConditioning conditioning;
     size_t file_size = 0;        // 0 for streams
 
     // Convert raw samples in `buf` to normalized float64 in `dest`.
