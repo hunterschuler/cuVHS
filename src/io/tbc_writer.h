@@ -28,6 +28,9 @@ struct TBCWriter {
     // Set NTSC field phase ID (1-4) for the current field.
     void set_field_phase_id(int phase_id);
 
+    // Set the raw sample position where this field starts (for debugging).
+    void set_file_loc(size_t file_loc);
+
     // Advance to next field. Commits metadata for the current field.
     void finish_field();
 
@@ -54,6 +57,7 @@ private:
     struct FieldMeta {
         bool is_first_field = true;
         int field_phase_id = 0;  // NTSC: 1-4, 0 = unset
+        size_t file_loc = 0;      // Raw sample position where field starts
         struct Dropout { int line; int start; int end; };
         std::vector<Dropout> dropouts;
     };

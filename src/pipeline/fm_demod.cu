@@ -146,20 +146,20 @@ static std::complex<double> fir_freqz(const std::vector<double>& h, double omega
 // CUDA Kernels
 // ============================================================
 
-// Copy samples_per_field doubles per field into fft_size-strided buffer, zero-padding.
 __global__ void k_copy_and_pad(
-    const double* src,           // [num_fields x samples_per_field]
-    double* dst,                 // [num_fields x fft_size]
-    int samples_per_field,
-    int fft_size,
-    int total_dst_samples)       // num_fields * fft_size
+    const double* src, double* dst, int samples_per_field, int fft_size, int total_dst_samples, int total_src_samples)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= total_dst_samples) return;
     int field = idx / fft_size;
     int pos   = idx % fft_size;
-    if (pos < samples_per_field) {
-        dst[idx] = src[(size_t)field * samples_per_field + pos];
+
+    long long src_idx = (long long)field * samples_per_field + pos;
+
+    // Pull continuous tape data to prevent FFT wrap-around transients.
+    // Only pad with zero if we hit the absolute end of the batch memory.
+    if (src_idx < total_src_samples) {
+        dst[idx] = src[src_idx];
     } else {
         dst[idx] = 0.0;
     }
@@ -246,15 +246,8 @@ __global__ void k_compute_envelope(
     envelope[idx] = sqrt(re * re + im * im);
 }
 
-// Sequential phase unwrap: one thread per field.
-// Matches Python: ediff1d(angles, to_begin=0) -> unwrap -> clamp [0,2pi] -> scale
 __global__ void k_unwrap_to_hz(
-    const double* angles,
-    double* demod,
-    int fft_size,
-    int samples_per_field,
-    double freq_hz,
-    int num_fields)
+    const double* angles, double* demod, int fft_size, int samples_per_field, double freq_hz, int num_fields)
 {
     int field = blockIdx.x * blockDim.x + threadIdx.x;
     if (field >= num_fields) return;
@@ -264,27 +257,15 @@ __global__ void k_unwrap_to_hz(
     int N = (fft_size < samples_per_field) ? fft_size : samples_per_field;
 
     double scale = freq_hz / TAU;
-    double prev_raw_dangle = 0.0;
-    double correction = 0.0;
-
     out[0] = 0.0;
-
     for (int i = 1; i < N; i++) {
-        double dangle = a[i] - a[i - 1];
-        double delta = dangle - prev_raw_dangle;
-        prev_raw_dangle = dangle;
-
-        if (delta > PI)       correction -= TAU;
-        else if (delta < -PI) correction += TAU;
-
-        double unwrapped = dangle + correction;
-        double clamped = fmod(unwrapped, TAU);
-        if (clamped < 0.0) clamped += TAU;
-
-        out[i] = clamped * scale;
+        double delta = a[i] - a[i - 1];
+        // True Instantaneous Frequency (prevents overshoot clipping)
+        if (delta > PI) delta -= TAU;
+        if (delta < -PI) delta += TAU;
+        out[i] = delta * scale;
     }
 }
-
 // Apply complex filter: out[k] = in[k] * filter[k]
 __global__ void k_apply_complex_filter(
     const cufftDoubleComplex* in,
@@ -329,8 +310,9 @@ bool FMDemodState::init(const VideoFormat& fmt, int max_batch_size, int samples_
     double nyquist = fs / 2.0;
 
     // ---- VHS NTSC SP RF filter parameters ----
-    double bpf_low        = 500000.0;
-    double bpf_high       = 6500000.0;
+    // RAISE the low cutoff to trap Chroma (629 kHz) and Audio (1.3 MHz)
+    double bpf_low        = 1500000.0;  // Changed from 0.5 MHz to 1.5 MHz
+    double bpf_high       = 6500000.0;  
     int    bpf_order      = 8;
     double lpf_extra_freq = 6000000.0;
     int    lpf_extra_ord  = 25;
@@ -360,9 +342,10 @@ bool FMDemodState::init(const VideoFormat& fmt, int max_batch_size, int samples_
     double b_shelf[3], a_shelf[3];
     gen_shelf_high(deemph_mid, deemph_gain, fs, deemph_q, b_shelf, a_shelf);
 
-    // ---- Video LPF: supergaussian 6.6 MHz order 9 ----
-    double video_lpf_freq  = 6600000.0;
-    int    video_lpf_order = 9;
+    // ---- Video LPF: supergaussian ----
+    // LOWER the cutoff to the actual VHS baseband limit
+    double video_lpf_freq  = 3000000.0; // Changed from 6.6 MHz to 3.0 MHz
+    int    video_lpf_order = 3;
 
     // ---- Sync FIR: 65-tap 0.5 MHz LPF ----
     double sync_cutoff_norm = 500000.0 / nyquist;
@@ -495,9 +478,10 @@ void fm_demod(FMDemodState& state,
     // d_scratch layout: [field0: fft_size doubles, field1: fft_size doubles, ...]
     // (only uses first fft_size doubles per field out of 2*fft_size available)
     {
-        int total = num_fields * fs;
-        int blocks = (total + T - 1) / T;
-        k_copy_and_pad<<<blocks, T>>>(d_raw, d_scratch, spf, fs, total);
+        int total_dst = num_fields * fs;
+        int total_src = num_fields * spf; // <-- The new variable
+        int blocks = (total_dst + T - 1) / T;
+        k_copy_and_pad<<<blocks, T>>>(d_raw, d_scratch, spf, fs, total_dst, total_src);
     }
 
     // Step 2: Forward FFT (R2C) of padded raw input
@@ -555,9 +539,10 @@ void fm_demod(FMDemodState& state,
     // Step 7: Copy demod into padded buffer for R2C
     // d_scratch = reinterpret_cast<double*>(d_analytic)  — already set
     {
-        int total = num_fields * fs;
-        int blocks = (total + T - 1) / T;
-        k_copy_and_pad<<<blocks, T>>>(d_demod, d_scratch, spf, fs, total);
+        int total_dst = num_fields * fs;
+        int total_src = num_fields * spf; // <-- The new variable
+        int blocks = (total_dst + T - 1) / T;
+        k_copy_and_pad<<<blocks, T>>>(d_demod, d_scratch, spf, fs, total_dst, total_src);
     }
 
     // Step 8: Forward FFT (R2C) of padded demod signal

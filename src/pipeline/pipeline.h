@@ -56,6 +56,11 @@ private:
     void* d_pulse_lengths = nullptr; // pulse lengths (batch x MAX_PULSES ints)
     void* d_pulse_count = nullptr;   // pulse count per field (batch ints)
     void* d_pulse_types = nullptr;   // pulse type classification (batch x MAX_PULSES ints)
+    
+    // NEW: Pulse Discovery buffers
+    void* d_candidate_indices = nullptr; // VSYNC candidate pulse indices (batch x 20 ints)
+    void* d_candidate_count = nullptr;   // Global candidate counter (1 int)
+    
     void* d_linelocs = nullptr;    // line locations (batch)
     void* d_envelope = nullptr;    // RF envelope magnitude (float64, batch)
     void* d_tbc_luma = nullptr;    // TBC luma output (uint16, batch)
@@ -75,11 +80,15 @@ private:
     bool allocate_buffers();
     void free_buffers();
 
-    // Pre-scan the raw file to find VSYNC-based field boundaries.
+    // Pre-scan via FM demod: tiles the raw file, demodulates each tile,
+    // and finds VSYNC positions in the clean demod domain using K3's
+    // state machine. This works on any capture hardware (unlike amplitude
+    // based prescan which requires head-switch artifacts).
     // Populates field_offsets[].
-    bool prescan_field_boundaries();
+    bool prescan_via_demod();
 
-    // Process one batch of fields using pre-scanned offsets.
-    // Returns number of fields processed (0 at EOF).
-    int process_batch(int start_field, int num_fields);
+    // Process one chunk of raw samples. Demodulates the chunk, finds
+    // field boundaries inline via VSYNC detection, then processes fields
+    // through the full pipeline. Returns number of fields processed.
+    int process_chunk(size_t raw_offset, int num_fields, size_t& next_raw_offset);
 };

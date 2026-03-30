@@ -301,7 +301,9 @@ __global__ void k_compute_linelocs(
 
     if (ref_pulse_idx >= 0) {
         ref_position = (double)starts[ref_pulse_idx];
-        ref_line = 19.0;
+        // First HSYNC after VSYNC is at line 10 in NTSC
+        // (lines 0-5: VSYNC, lines 6-9: EQ/transition, line 10: first active HSYNC)
+        ref_line = 10.0;
 
         // If the state machine found a VSYNC late in the pulse list, it likely
         // locked onto the NEXT field's VSYNC (at the end of this field's chunk)

@@ -3,10 +3,10 @@
 #include "pipeline/sync_pulses.h"
 #include "pipeline/line_locs.h"
 #include "pipeline/hsync_refine.h"
-#include "pipeline/lineloc_coherence.h"
 #include "pipeline/tbc_resample.h"
 #include "pipeline/chroma_decode.h"
 #include "pipeline/dropout_detect.h"
+#include "pipeline/vsync_discover.h"
 
 #include <cuda_runtime.h>
 #include <cufft.h>
@@ -15,19 +15,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
-
-// Debug: dump first N samples of a GPU buffer to /tmp for comparison with Python
-static void dump_gpu_doubles(const char* path, const double* d_ptr, size_t count) {
-    auto* h = new double[count];
-    cudaMemcpy(h, d_ptr, count * sizeof(double), cudaMemcpyDeviceToHost);
-    FILE* fp = fopen(path, "wb");
-    if (fp) {
-        fwrite(h, sizeof(double), count, fp);
-        fclose(fp);
-        fprintf(stderr, "  [debug] dumped %zu doubles to %s\n", count, path);
-    }
-    delete[] h;
-}
+#include <algorithm>
 
 // Which fields to dump (set via CUVHS_DUMP_FIELDS="0,28" env var, default: 0,28)
 static std::vector<int> get_dump_fields() {
@@ -45,8 +33,6 @@ static std::vector<int> get_dump_fields() {
     }
     return result;
 }
-
-static const int DUMP_SAMPLES = 20000;  // how many samples to dump per field
 
 Pipeline::Pipeline(const GPUDevice& gpu_, const VideoFormat& fmt_,
                    RawReader& reader_, TBCWriter& writer_)
@@ -149,6 +135,10 @@ bool Pipeline::allocate_buffers() {
         alloc(&d_pulse_lengths, n * MAX_PULSES * sizeof(int));
         alloc(&d_pulse_count,   n * sizeof(int));
         alloc(&d_pulse_types,   n * MAX_PULSES * sizeof(int));
+        // Allocate space for up to 20 candidate pulses per field (very generous)
+        alloc(&d_candidate_indices, n * 20 * sizeof(int));
+        // Just one integer for the global atomic counter
+        alloc(&d_candidate_count, sizeof(int));        
         alloc(&d_linelocs,   n * fmt.lines_per_frame * sizeof(double));
         alloc(&d_is_first_field, n * sizeof(int));
         alloc(&d_tbc_luma,   n * tbc_field_size * sizeof(uint16_t));
@@ -202,279 +192,53 @@ void Pipeline::free_buffers() {
     safe_free(&d_do_starts);
     safe_free(&d_do_ends);
     safe_free(&d_do_count);
+    safe_free(&d_candidate_indices);
+    safe_free(&d_candidate_count);
 }
 
 // ============================================================================
-// Pre-scan: find VSYNC-based field boundaries in the raw file
+// Process one chunk: demod, find VSYNC inline, process through full pipeline
 // ============================================================================
 //
-// CPU envelope scan detects one field type (type A) reliably from the raw u8
-// amplitude. The other type (B) has a subtler VSYNC that doesn't cross the
-// amplitude threshold. We interpolate type-B positions as midpoints between
-// consecutive type-A fields, then merge and sort.
+// Reads a contiguous chunk of raw samples, demodulates it, finds VSYNC positions
+// in the demod domain using K2/K3, then processes the fields through the full
+// pipeline (K4-K7). All in one pass - no separate prescan needed.
 //
-// K3's VSYNC state machine handles ±500 sample position errors naturally,
-// so interpolated positions don't need to be exact.
+// NTSC note: Assumes ~955K samples per field (29.97 fps, 31336 samples/line, 262.5 lines).
+// PAL would need different nominal spacing.
 
-bool Pipeline::prescan_field_boundaries() {
-    if (reader.is_stream()) {
-        return true;  // stream mode: field boundaries found inline
-    }
-
-    size_t total_samples = reader.total_samples();
-    size_t spf = fmt.samples_per_field;
-
-    fprintf(stderr, "Pre-scanning for field boundaries...\n");
-    auto t0 = std::chrono::steady_clock::now();
-
-    // Dual sliding window parameters
-    int short_win = (int)(fmt.samples_per_line / 2);   // ~890 samples (half a line)
-    if (short_win < 100) short_win = 100;
-    size_t long_win = spf * 50;                         // ~50 fields for local baseline
-    int vsync_min_run = (int)(fmt.vsync_width * 0.5);
-
-    // Chunked I/O: 256 MB chunks, overlapping by long_win
-    size_t chunk_bytes = 256 * 1024 * 1024;
-    size_t overlap = long_win;
-    auto* buf = new uint8_t[chunk_bytes + overlap];
-
-    std::vector<size_t> type_a;
-    size_t last_end = 0;
-
-    // Sliding window state (carried across chunks)
-    double short_sum = 0.0;
-    double long_sum = 0.0;
-    size_t long_count = 0;    // grows from short_win up to long_win
-    int run_len = 0;
-
-    int num_chunks = (int)((total_samples + chunk_bytes - 1) / chunk_bytes);
-    int chunk_idx = 0;
-
-    for (size_t chunk_start = 0; chunk_start < total_samples; ) {
-        // Read this chunk (with overlap from previous if not first)
-        size_t read_start = (chunk_start > overlap && chunk_idx > 0)
-                            ? chunk_start - overlap : chunk_start;
-        size_t read_len = std::min(chunk_bytes + overlap, total_samples - read_start);
-        size_t n_read = reader.read_raw_at(buf, read_start, read_len);
-        if (n_read < (size_t)short_win) break;
-
-        // On first chunk, initialize short window
-        size_t scan_start_in_buf = (chunk_idx == 0) ? (size_t)short_win : overlap;
-
-        if (chunk_idx == 0) {
-            short_sum = 0.0;
-            for (int i = 0; i < short_win; i++) short_sum += buf[i];
-            long_sum = short_sum;
-            long_count = short_win;
-        } else {
-            // Re-initialize windows from overlap region
-            short_sum = 0.0;
-            for (size_t i = scan_start_in_buf - short_win; i < scan_start_in_buf; i++)
-                short_sum += buf[i];
-            long_sum = 0.0;
-            size_t lw_actual = std::min(long_count, scan_start_in_buf);
-            for (size_t i = scan_start_in_buf - lw_actual; i < scan_start_in_buf; i++)
-                long_sum += buf[i];
-            long_count = lw_actual;
-        }
-
-        // Scan only the NEW samples in this chunk (not the overlap tail, which
-        // will be scanned as the overlap prefix of the next chunk).
-        // For chunk 0: scan up to chunk_bytes (or n_read if file is smaller).
-        // For chunk N>0: scan from overlap to overlap + chunk_bytes.
-        size_t scan_end_in_buf = std::min(n_read,
-            (chunk_idx == 0) ? chunk_bytes : overlap + chunk_bytes);
-        // But don't exceed what we actually read
-        if (scan_end_in_buf > n_read) scan_end_in_buf = n_read;
-
-        for (size_t i = scan_start_in_buf; i < scan_end_in_buf; i++) {
-            // Update short window
-            short_sum += buf[i];
-            short_sum -= buf[i - short_win];
-
-            // Update long window (growing phase: expand until long_win reached)
-            long_sum += buf[i];
-            if (long_count < long_win) {
-                long_count++;
-            } else {
-                long_sum -= buf[i - long_win];
-            }
-
-            double short_mean = short_sum / short_win;
-            double long_mean = long_sum / (double)long_count;
-
-            size_t abs_pos = read_start + i;
-
-            if (short_mean < long_mean * 0.85) {
-                run_len++;
-            } else {
-                if (run_len >= vsync_min_run) {
-                    if (type_a.empty() || (abs_pos > last_end && (abs_pos - last_end) > spf / 2)) {
-                        type_a.push_back(abs_pos);
-                        last_end = abs_pos;
-                    }
-                }
-                run_len = 0;
-            }
-        }
-
-        chunk_start += chunk_bytes;
-        chunk_idx++;
-        fprintf(stderr, "\r  [prescan] chunk %d/%d (%.0f%%)...",
-                chunk_idx, num_chunks, 100.0 * chunk_start / total_samples);
-    }
-    fprintf(stderr, "\n");
-
-    delete[] buf;
-
-    auto t_scan = std::chrono::steady_clock::now();
-    double scan_ms = std::chrono::duration<double, std::milli>(t_scan - t0).count();
-
-    fprintf(stderr, "  [prescan] envelope scan: %.0fms, found %zu type-A fields\n",
-            scan_ms, type_a.size());
-
-    if (type_a.size() < 2) {
-        fprintf(stderr, "  Not enough type-A fields found\n");
-        return false;
-    }
-
-    // Phase 2: build full field offset list
-    //
-    // Type-A detections give us every-other VSYNC (~955K apart = 2 fields).
-    // The missing type-B fields sit at the midpoints between consecutive
-    // type-A fields. K3 handles ±500 sample position errors naturally.
-    //
-    // Special case: field 0 starts at offset 0 (before the first VSYNC),
-    // matching Python. The first type-A detection IS field 1's VSYNC.
-    // We only interpolate between consecutive type-A fields after that.
-    field_offsets.clear();
-    // No fixed backtrack — the VSYNC dip end position is used directly.
-    // K3 searches the full spf-sized chunk for the VSYNC state machine,
-    // so it doesn't matter exactly where the VSYNC falls within the chunk.
-    // This avoids a tape/VCR-specific calibration constant.
-    size_t backtrack = 0;
-
-    // Field 0: starts at sample 0
-    field_offsets.push_back(0);
-
-    // Field 1: first type-A VSYNC position
-    if (!type_a.empty()) {
-        size_t a_start = (type_a[0] > backtrack) ? type_a[0] - backtrack : 0;
-        field_offsets.push_back(a_start);
-    }
-
-    // Fields 2+: for each consecutive pair of type-A VSYNCs,
-    // determine how many fields fit in the gap and space them evenly.
-    //
-    // Normally type-A fields are ~2 field-spacings apart (every other VSYNC
-    // has a strong enough dip to detect). But gaps can vary:
-    //   ~1 field:  false type-A detection or both heads produced strong VSYNC
-    //              → no interpolation needed, just emit the next type-A
-    //   ~2 fields: normal case → insert one midpoint (type-B)
-    //   ~3 fields: one type-A was missed → insert two evenly-spaced fields
-    //   ~4 fields: two missed → insert three, etc.
-    //
-    // This prevents phantom fields (from ~1-field gaps with a midpoint shoved in)
-    // and missed fields (from ~4-field gaps with only one midpoint).
-    for (size_t i = 1; i < type_a.size(); i++) {
-        size_t gap = type_a[i] - type_a[i - 1];
-        // How many fields fit in this gap? Round to nearest integer.
-        int n_fields = (int)((double)gap / spf + 0.5);
-        if (n_fields < 1) n_fields = 1;
-
-        // Insert (n_fields - 1) evenly-spaced intermediate fields, then the type-A
-        for (int k = 1; k < n_fields; k++) {
-            size_t interp = type_a[i - 1] + (size_t)((double)gap * k / n_fields);
-            field_offsets.push_back(interp);
-        }
-
-        // Type-A: this VSYNC
-        size_t a_start = (type_a[i] > backtrack) ? type_a[i] - backtrack : 0;
-        field_offsets.push_back(a_start);
-    }
-
-    auto t_done = std::chrono::steady_clock::now();
-    double total_ms = std::chrono::duration<double, std::milli>(t_done - t0).count();
-
-    fprintf(stderr, "  [prescan] %.0fms total, %zu fields (%zu type-A + %zu interpolated)\n",
-            total_ms, field_offsets.size(), type_a.size(),
-            field_offsets.size() - type_a.size());
-    if (field_offsets.size() >= 2) {
-        double avg_spacing = (double)(field_offsets.back() - field_offsets.front())
-                             / (field_offsets.size() - 1);
-        fprintf(stderr, "  Average field spacing: %.0f samples (nominal: %zu)\n",
-                avg_spacing, spf);
-    }
-
-    // Dump field offsets for comparison with Python
-    {
-        FILE* fp = fopen("/tmp/cuvhs_field_offsets.txt", "w");
-        if (fp) {
-            for (size_t i = 0; i < field_offsets.size(); i++) {
-                fprintf(fp, "field %zu: offset %zu\n", i, field_offsets[i]);
-            }
-            fclose(fp);
-            fprintf(stderr, "  [debug] wrote field offsets to /tmp/cuvhs_field_offsets.txt\n");
-        }
-    }
-
-    return !field_offsets.empty();
-}
-
-// ============================================================================
-// Process a batch of fields using pre-scanned offsets
-// ============================================================================
-
-int Pipeline::process_batch(int start_field, int num_fields) {
+int Pipeline::process_chunk(size_t raw_offset, int num_fields, size_t& next_raw_offset) {
     size_t spf = fmt.samples_per_field;
     size_t spf_padded = spf + FIELD_MARGIN_LINES * fmt.samples_per_line;
     size_t tbc_field_size = fmt.output_line_len * fmt.output_field_lines;
 
-    // Read each field from its pre-scanned offset (spf_padded samples each)
-    auto* h_raw = new double[num_fields * spf_padded];
-    int fields_loaded = 0;
+    // Read contiguous raw: num_fields * spf_padded (each field needs spf_padded samples)
+    size_t total_samples = (size_t)num_fields * spf_padded;
+    auto* h_raw = new double[total_samples];
 
-    for (int i = 0; i < num_fields; i++) {
-        int fi = start_field + i;
-        if (fi >= (int)field_offsets.size()) break;
-
-        size_t offset = field_offsets[fi];
-        size_t n_read = reader.read_at(h_raw + (size_t)i * spf_padded, offset, spf_padded);
-        if (n_read < spf / 2) break;
-        // Zero-pad if short
-        if (n_read < spf_padded) {
-            memset(h_raw + (size_t)i * spf_padded + n_read, 0, (spf_padded - n_read) * sizeof(double));
-        }
-        fields_loaded++;
+    size_t n_read = reader.read_at(h_raw, raw_offset, total_samples);
+    if (n_read < spf) {
+        delete[] h_raw;
+        return 0;
+    }
+    if (n_read < total_samples) {
+        memset(h_raw + n_read, 0, (total_samples - n_read) * sizeof(double));
     }
 
+    int fields_loaded = (int)(n_read / spf);
+    if (fields_loaded > num_fields) fields_loaded = num_fields;
     if (fields_loaded == 0) {
         delete[] h_raw;
         return 0;
     }
 
-    // 2. Upload to GPU
-    cudaMemcpy(d_raw, h_raw, fields_loaded * spf_padded * sizeof(double),
-               cudaMemcpyHostToDevice);
+    // Upload contiguous raw to GPU
+    cudaMemcpy(d_raw, h_raw, total_samples * sizeof(double), cudaMemcpyHostToDevice);
     delete[] h_raw;
 
-    // --- Debug: dump pre-K1 raw data for target fields ---
-    {
-        static auto dump_fields = get_dump_fields();
-        for (int df : dump_fields) {
-            int local_idx = df - start_field;
-            if (local_idx >= 0 && local_idx < fields_loaded) {
-                char path[256];
-                snprintf(path, sizeof(path), "/tmp/cuvhs_raw_field%d.bin", df);
-                size_t dump_n = std::min((size_t)DUMP_SAMPLES, spf_padded);
-                dump_gpu_doubles(path,
-                    static_cast<double*>(d_raw) + (size_t)local_idx * spf_padded,
-                    dump_n);
-            }
-        }
-    }
-
-    // 3. FM Demodulation (Kernel 1) — demod spf_padded samples per field
+    // ================================================================
+    // K1: FM demod → contiguous d_demod, d_demod_05, d_envelope
+    // ================================================================
     fm_demod(demod_state,
              static_cast<double*>(d_raw),
              static_cast<double*>(d_demod),
@@ -482,44 +246,137 @@ int Pipeline::process_batch(int start_field, int num_fields) {
              static_cast<double*>(d_envelope),
              fields_loaded, spf_padded, fmt);
 
-    // --- Debug: dump post-K1 demod_05 for target fields ---
-    {
-        static auto dump_fields = get_dump_fields();
-        for (int df : dump_fields) {
-            int local_idx = df - start_field;
-            if (local_idx >= 0 && local_idx < fields_loaded) {
-                char path[256];
-                snprintf(path, sizeof(path), "/tmp/cuvhs_demod05_field%d.bin", df);
-                size_t dump_n = std::min((size_t)DUMP_SAMPLES, spf_padded);
-                dump_gpu_doubles(path,
-                    static_cast<double*>(d_demod_05) + (size_t)local_idx * spf_padded,
-                    dump_n);
-            }
+    // ================================================================
+    // NEW: Global Pulse Discovery (Replaces uniform-stride K2/K3)
+    // ================================================================
+    int total_chunk_samples = fields_loaded * spf_padded;
+    int candidate_capacity = fields_loaded * 20;
+    
+    // Ensure the counter is zeroed out before launching
+    cudaMemset(d_candidate_count, 0, sizeof(int));
+
+    discover_vsyncs(static_cast<double*>(d_demod_05),
+                    static_cast<int*>(d_candidate_indices),
+                    static_cast<int*>(d_candidate_count),
+                    candidate_capacity,
+                    total_chunk_samples,
+                    fmt);
+
+    // Download candidates to CPU
+    int num_candidates;
+    cudaMemcpy(&num_candidates, d_candidate_count, sizeof(int), cudaMemcpyDeviceToHost);
+    int stored_candidates = std::min(num_candidates, candidate_capacity);
+    if (num_candidates > candidate_capacity) {
+        fprintf(stderr, "Warning: VSYNC candidate buffer overflow (%d > %d), truncating chunk results\n",
+                num_candidates, candidate_capacity);
+    }
+
+    std::vector<int> h_candidates(stored_candidates);
+    if (stored_candidates > 0) {
+        cudaMemcpy(h_candidates.data(), d_candidate_indices,
+                   (size_t)stored_candidates * sizeof(int), cudaMemcpyDeviceToHost);
+    }
+
+    // Atomic adds don't guarantee order, so sort the indices
+    std::sort(h_candidates.begin(), h_candidates.end());
+
+    // Cluster the 27µs pulses into Field boundaries
+    std::vector<size_t> chunk_field_offsets;
+    for (int pos : h_candidates) {
+        // If this is the first pulse, or it's at least half a field away from the last recorded boundary
+        if (chunk_field_offsets.empty() || 
+           (pos - chunk_field_offsets.back() > fmt.samples_per_field / 2)) 
+        {
+            // Back up ~5 lines so the K2/K3 window starts BEFORE the VSYNC.
+            // This guarantees K3's state machine sees the required leading HSYNCs.
+            size_t safe_offset = (pos > (5 * fmt.samples_per_line)) ? 
+                                 (pos - 5 * fmt.samples_per_line) : 0;
+            
+            chunk_field_offsets.push_back(safe_offset);
         }
     }
 
-    // 4. Find Sync Pulses (Kernel 2) — uses spf_padded stride for buffer addressing
+    if (chunk_field_offsets.empty()) {
+        fprintf(stderr, "Warning: no VSYNC candidates found in chunk at raw offset %zu, using nominal field spacing fallback\n",
+                raw_offset);
+        for (int i = 0; i < fields_loaded; i++) {
+            chunk_field_offsets.push_back((size_t)i * spf);
+        }
+    }
+
+    fields_loaded = (int)chunk_field_offsets.size();
+    if (fields_loaded > num_fields) {
+        fields_loaded = num_fields;  // cap to buffer allocation
+        chunk_field_offsets.resize(fields_loaded);
+    }
+
+    // Compute actual field spacing from detected fields (handles VCR speed drift)
+    size_t actual_spf = spf;  // default to nominal
+    if (chunk_field_offsets.size() >= 2) {
+        size_t total_span = chunk_field_offsets.back() - chunk_field_offsets.front();
+        size_t num_gaps = chunk_field_offsets.size() - 1;
+        actual_spf = total_span / num_gaps;
+    }
+
+    // ----------------------------------------------------------------
+    // NEW: The "Look-Back" Stitching Margin
+    // ----------------------------------------------------------------
+    // Predict where the NEXT field's VSYNC will start
+    size_t predicted_next_field = chunk_field_offsets.back() + actual_spf;
+
+    // Pull the start pointer backwards by 10 horizontal lines. 
+    // This creates a microscopic overlap (~30,000 samples) ensuring the 
+    // next GPU batch swallows the entire VSYNC block whole, even if the tape sped up.
+    size_t safe_margin = 10 * fmt.samples_per_line;
+
+    if (predicted_next_field > safe_margin) {
+        next_raw_offset = raw_offset + predicted_next_field - safe_margin;
+    } else {
+        next_raw_offset = raw_offset + predicted_next_field; // Fallback
+    }
+
+    // --- REMOVED delete[] h_k3_debug; ---
+
+    // Debug output to file for comparison with vhs-decode
+    static FILE* debug_fp = nullptr;
+    if (debug_fp == nullptr) {
+        debug_fp = fopen("/tmp/cuvhs_debug.txt", "w");
+    }
+    if (debug_fp) {
+        fprintf(debug_fp, "Chunk at raw_offset=%zu (%.1f sec):\n",
+                raw_offset, (double)raw_offset / 28000000.0);
+        for (size_t i = 0; i < chunk_field_offsets.size(); i++) {
+            fprintf(debug_fp, "  Field %zu: chunk_offset=%zu file_offset=%zu (%.3f sec)\n",
+                    i, chunk_field_offsets[i], raw_offset + chunk_field_offsets[i],
+                    (double)(raw_offset + chunk_field_offsets[i]) / 28000000.0);
+        }
+        fprintf(debug_fp, "  actual_spf=%zu (nominal=%zu, diff=%+.0f)\n",
+                actual_spf, spf, (double)actual_spf - (double)spf);
+        fprintf(debug_fp, "  next_raw_offset=%zu\n", next_raw_offset);
+        
+        // --- FIXED: Replaced unique_vsyncs with num_candidates ---
+        fprintf(debug_fp, "  [prescan] %d candidate pulses (%d stored) → %d fields\n\n",
+                num_candidates, stored_candidates, fields_loaded);
+        fflush(debug_fp);
+    }
+
+    // ================================================================
+    // Upload field offsets to GPU and re-run K2 with correct offsets
+    // ================================================================
+    size_t* d_field_offsets = nullptr;
+    cudaMalloc(&d_field_offsets, fields_loaded * sizeof(size_t));
+    cudaMemcpy(d_field_offsets, chunk_field_offsets.data(),
+               fields_loaded * sizeof(size_t), cudaMemcpyHostToDevice);
+
+    // K2 (re-run): find pulses at correct field boundaries
     sync_pulses(static_cast<double*>(d_demod_05),
                 static_cast<int*>(d_pulse_starts),
                 static_cast<int*>(d_pulse_lengths),
                 static_cast<int*>(d_pulse_count),
+                d_field_offsets,
                 fields_loaded, spf_padded, fmt);
 
-    // --- Debug: dump pulse counts ---
-    {
-        auto* h_pc = new int[fields_loaded];
-        cudaMemcpy(h_pc, d_pulse_count, fields_loaded * sizeof(int), cudaMemcpyDeviceToHost);
-        static auto dump_fields = get_dump_fields();
-        for (int df : dump_fields) {
-            int local_idx = df - start_field;
-            if (local_idx >= 0 && local_idx < fields_loaded) {
-                fprintf(stderr, "  [debug] field %d: %d pulses\n", df, h_pc[local_idx]);
-            }
-        }
-        delete[] h_pc;
-    }
-
-    // 5. Classify Pulses + Line Locations (Kernel 3)
+    // K3: Classify pulses + line locations (now with correct field alignment)
     K3Debug* d_k3_debug = nullptr;
     {
         static auto dump_fields = get_dump_fields();
@@ -536,13 +393,13 @@ int Pipeline::process_batch(int start_field, int num_fields) {
               static_cast<int*>(d_is_first_field),
               fields_loaded, fmt, d_k3_debug);
 
-    // --- Debug: dump K3 decisions for target fields ---
+    // Debug: dump K3 decisions
     if (d_k3_debug) {
         static auto dump_fields = get_dump_fields();
         auto* h_dbg = new K3Debug[fields_loaded];
         cudaMemcpy(h_dbg, d_k3_debug, fields_loaded * sizeof(K3Debug), cudaMemcpyDeviceToHost);
         for (int df : dump_fields) {
-            int local_idx = df - start_field;
+            int local_idx = df;
             if (local_idx >= 0 && local_idx < fields_loaded) {
                 const K3Debug& d = h_dbg[local_idx];
                 fprintf(stderr, "  [K3 debug] field %d: npc=%d ref_idx=%d ref_pos=%.1f ref_line=%.1f "
@@ -556,29 +413,14 @@ int Pipeline::process_batch(int start_field, int num_fields) {
         cudaFree(d_k3_debug);
     }
 
-    // 6. Refine Line Locations via Hsync Zero-Crossing (Kernel 4)
+    // K4: Refine Line Locations via Hsync Zero-Crossing
     hsync_refine(static_cast<double*>(d_demod_05),
                  static_cast<double*>(d_linelocs),
                  fields_loaded,
                  fields_loaded * (int)spf_padded,
                  fmt);
 
-    // --- Debug: dump linelocs for target fields ---
-    {
-        static auto dump_fields = get_dump_fields();
-        for (int df : dump_fields) {
-            int local_idx = df - start_field;
-            if (local_idx >= 0 && local_idx < fields_loaded) {
-                char path[256];
-                snprintf(path, sizeof(path), "/tmp/cuvhs_linelocs_field%d.bin", df);
-                dump_gpu_doubles(path,
-                    static_cast<double*>(d_linelocs) + (size_t)local_idx * fmt.lines_per_frame,
-                    fmt.lines_per_frame);
-            }
-        }
-    }
-
-    // 7. TBC Resample (Kernel 5) — total_demod_samples = fields * spf_padded
+    // K5: TBC Resample
     tbc_resample(static_cast<double*>(d_demod),
                  static_cast<double*>(d_linelocs),
                  static_cast<uint16_t*>(d_tbc_luma),
@@ -586,9 +428,7 @@ int Pipeline::process_batch(int start_field, int num_fields) {
                  fields_loaded * (int)spf_padded,
                  fmt);
 
-    // 8. Chroma Decode (Kernel 6)
-    // d_demod is reused as scratch — K5 (luma resample) is done with it
-    // Pass &chroma_state to carry track/phase info across batch boundaries
+    // K6: Chroma Decode
     std::vector<int> field_phase_ids;
     chroma_decode(static_cast<double*>(d_raw),
                   static_cast<double*>(d_linelocs),
@@ -600,7 +440,7 @@ int Pipeline::process_batch(int start_field, int num_fields) {
                   field_phase_ids,
                   &chroma_state);
 
-    // 9. Dropout Detection + Concealment (Kernel 7)
+    // K7: Dropout Detection + Concealment
     dropout_detect(static_cast<double*>(d_envelope),
                    static_cast<double*>(d_linelocs),
                    static_cast<uint16_t*>(d_tbc_luma),
@@ -611,7 +451,7 @@ int Pipeline::process_batch(int start_field, int num_fields) {
                    static_cast<int*>(d_do_count),
                    fields_loaded, spf_padded, fmt);
 
-    // 10. Download TBC results + dropout metadata and write to disk
+    // Download TBC results + dropout metadata and write to disk
     auto* h_luma = new uint16_t[fields_loaded * tbc_field_size];
     auto* h_chroma = new uint16_t[fields_loaded * tbc_field_size];
 
@@ -639,18 +479,18 @@ int Pipeline::process_batch(int start_field, int num_fields) {
     static bool last_parity = true;
 
     for (int i = 0; i < fields_loaded; i++) {
+        // Set fileLoc for JSON output (for debugging field position alignment)
+        size_t file_loc = raw_offset + chunk_field_offsets[(size_t)i];
+        writer.set_file_loc(file_loc);
+        
         writer.write_luma_field(h_luma + i * tbc_field_size);
         writer.write_chroma_field(h_chroma + i * tbc_field_size);
 
         // Field parity: use VSYNC-based detection, but enforce alternation.
-        // Two consecutive fields can never have the same parity in valid interlaced video.
-        // Detection is only useful to establish initial parity or correct after a glitch.
         bool first_field;
         if (h_is_first[i] >= 0 && (h_is_first[i] == 1) != last_parity) {
-            // Detection agrees with alternation — trust it
             first_field = (h_is_first[i] == 1);
         } else {
-            // Unknown OR detection conflicts with alternation — alternate
             first_field = !last_parity;
         }
         last_parity = first_field;
@@ -680,6 +520,7 @@ int Pipeline::process_batch(int start_field, int num_fields) {
     delete[] h_do_ends;
     delete[] h_do_count;
     delete[] h_is_first;
+    cudaFree(d_field_offsets);
 
     return fields_loaded;
 }
@@ -689,46 +530,43 @@ bool Pipeline::run() {
         return false;
 
     bool streaming = reader.is_stream();
+    size_t total_samples = streaming ? 0 : reader.total_samples();
 
-    // Pre-scan to find field boundaries (file mode only)
-    if (!streaming) {
-        if (!prescan_field_boundaries()) {
-            fprintf(stderr, "Failed to find any field boundaries\n");
-            return false;
-        }
-    }
-
-    int total_fields_est = streaming ? 0 : (int)field_offsets.size();
+    int total_fields_est = streaming ? 0 : (int)(total_samples / fmt.samples_per_field);
 
     if (streaming) {
-        fprintf(stderr, "Starting decode: streaming mode, batches of %d fields\n", batch_size);
+        fprintf(stderr, "Starting decode: streaming mode, chunks of %d fields\n", batch_size);
     } else {
-        fprintf(stderr, "Starting decode: %d fields in batches of %d\n",
+        fprintf(stderr, "Starting decode: ~%d fields in chunks of %d\n",
                 total_fields_est, batch_size);
     }
 
     auto t_start = std::chrono::steady_clock::now();
     int total_fields = 0;
+    size_t raw_offset = 0;
 
     // Progress display: print two lines initially so \033[A can move up
     fprintf(stderr, "\n\n");
     fflush(stderr);
 
     while (true) {
-        int fields_this_batch = batch_size;
+        int fields_this_chunk = batch_size;
 
         if (!streaming) {
-            int remaining = total_fields_est - total_fields;
-            if (remaining <= 0) break;
-            fields_this_batch = std::min(batch_size, remaining);
+            size_t remaining_samples = total_samples - raw_offset;
+            int remaining_fields = (int)(remaining_samples / fmt.samples_per_field);
+            if (remaining_fields <= 0) break;
+            fields_this_chunk = std::min(batch_size, remaining_fields);
         }
 
-        int processed = process_batch(total_fields, fields_this_batch);
+        size_t next_raw_offset;
+        int processed = process_chunk(raw_offset, fields_this_chunk, next_raw_offset);
         if (processed == 0) break;  // EOF or error
 
+        raw_offset = next_raw_offset;
         total_fields += processed;
 
-        // Write JSON after each batch so partial results are usable if we crash/get killed
+        // Write JSON after each chunk so partial results are usable if we crash/get killed
         writer.write_json();
 
         // Progress dashboard (two lines, rewritten in-place)

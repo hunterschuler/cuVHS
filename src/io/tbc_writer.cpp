@@ -20,6 +20,14 @@ bool TBCWriter::open(const std::string& output_base, const VideoFormat& format, 
             fprintf(stderr, "Output exists: %s (use --overwrite)\n", luma_path.c_str());
             return false;
         }
+        if (stat(chroma_path.c_str(), &st) == 0) {
+            fprintf(stderr, "Output exists: %s (use --overwrite)\n", chroma_path.c_str());
+            return false;
+        }
+        if (stat(json_path.c_str(), &st) == 0) {
+            fprintf(stderr, "Output exists: %s (use --overwrite)\n", json_path.c_str());
+            return false;
+        }
     }
 
     luma_fp = fopen(luma_path.c_str(), "wb");
@@ -66,6 +74,10 @@ void TBCWriter::set_first_field(bool is_first) {
 
 void TBCWriter::set_field_phase_id(int phase_id) {
     current_field.field_phase_id = phase_id;
+}
+
+void TBCWriter::set_file_loc(size_t file_loc) {
+    current_field.file_loc = file_loc;
 }
 
 void TBCWriter::finish_field() {
@@ -120,6 +132,7 @@ bool TBCWriter::write_json() {
         fprintf(fp, "    {\n");
         fprintf(fp, "      \"isFirstField\": %s,\n", f.is_first_field ? "true" : "false");
         fprintf(fp, "      \"seqNo\": %d,\n", i + 1);
+        fprintf(fp, "      \"fileLoc\": %zu,\n", f.file_loc);
         if (f.field_phase_id > 0) {
             fprintf(fp, "      \"fieldPhaseID\": %d,\n", f.field_phase_id);
         }

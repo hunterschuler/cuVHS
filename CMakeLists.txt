@@ -7,6 +7,7 @@ set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
 # Build for all modern GPU architectures unless user specifies
+# (Note: Your RTX 3090 uses architecture 86, which is covered here!)
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
     set(CMAKE_CUDA_ARCHITECTURES "60;70;75;80;86;89;90")
 endif()
@@ -24,10 +25,10 @@ add_executable(cuvhs
     src/format/video_format.cpp
     src/pipeline/pipeline.cu
     src/pipeline/fm_demod.cu
+    src/pipeline/vsync_discover.cu    # <--- NEW FILE ADDED HERE
     src/pipeline/sync_pulses.cu
     src/pipeline/line_locs.cu
     src/pipeline/hsync_refine.cu
-    src/pipeline/lineloc_coherence.cu
     src/pipeline/tbc_resample.cu
     src/pipeline/chroma_decode.cu
     src/pipeline/dropout_detect.cu
