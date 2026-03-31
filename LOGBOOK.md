@@ -1901,3 +1901,297 @@ file, causing periodic chroma dropout.
 - vhs-decode handles this differently: it validates each field against the previous one's
   timing, which provides implicit temporal coherence. The K3 fix achieves the same result
   without cross-field state, preserving full parallelism.
+
+---
+
+## TBC Line-Origin Fix: Wrapped Top-of-Field Band at Bottom of Output (2026-03-31)
+
+### Symptom
+
+After the black-streak work stabilized, cuVHS output looked broadly correct but the field
+origin was vertically wrong compared to `vhs-decode`.
+
+Observed in field 1:
+
+- In cuVHS luma, the dark non-picture/head-switching band appeared at the **bottom** of the
+  263-line field.
+- In `vhs-decode`, the equivalent band appeared at the **top** of the field.
+- In `ld-analyse`, enabling chroma appeared to "black out" several top image lines. This was
+  consistent with luma and chroma both being mapped from the wrong wrapped field origin.
+
+Measured row-mean evidence:
+
+- cuVHS before fix: darkest rows were `255-258`, with row `256` the minimum at `2185.4`
+- `vhs-decode`: darkest rows were `3-5`, with row `3` in the expected top-of-field region
+
+The difference is approximately `263 - 10/11` lines, which strongly suggested a wrapped
+line-origin offset rather than random corruption.
+
+### Root Cause
+
+Both luma and chroma resampling were mapping output row `out_line` to the lineloc grid as:
+
+```cpp
+ll_line = out_line + active_line_start;
+```
+
+This was incorrect for TBC output. The `linelocs` array already represents the full field.
+Adding `active_line_start` at resample time shifted the entire raster downward by about
+10 lines and wrapped the top-of-field non-picture region to the bottom of the 263-line field.
+
+The same mistake existed in both:
+
+- `src/pipeline/tbc_resample.cu`
+- `src/pipeline/chroma_decode.cu`
+
+That is why the luma stripe location and the chroma-on top-line masking moved together.
+
+### Fix
+
+Map output rows directly to full-field lineloc rows:
+
+```cpp
+ll_line = out_line;
+```
+
+Applied in:
+
+- `src/pipeline/tbc_resample.cu`
+- `src/pipeline/chroma_decode.cu`
+
+### Result
+
+Fresh validation on `TAPE1_lineorigin_test`:
+
+- darkest band moved from the bottom to the top of field 1
+- field 1 minimum row changed from `256` to `4`
+- top row means after fix:
+  `14876.9, 12795.9, 12255.3, 7249.1, 2280.2, 2451.7, 8122.8, ...`
+- bottom rows no longer contain the wrapped dark band
+
+Visually, the output now matches `vhs-decode`'s top-of-field placement much more closely.
+
+### Review Notes
+
+Current uncommitted diff vs commit `21bce9c` consists only of these two line-origin changes.
+No additional code-path regressions were introduced in this step.
+
+---
+
+## Architecture Shift: Prescan-First → Demod-First Pipeline (2026-03-30 to 2026-03-31)
+
+### Old Architecture
+
+The last prescan-era architecture (ending at commit `38ebd31`) worked like this:
+
+1. Run a separate whole-file prescan (`prescan_field_boundaries()` in `src/pipeline/pipeline.cu`)
+   using a raw-envelope sliding-window detector.
+2. Build a global `field_offsets[]` table from type-A detections plus interpolated fields.
+3. Decode in `process_batch()` using those precomputed offsets.
+
+In that model, field boundaries were decided *before* the main decode path. The decode stage
+then treated those prescanned offsets as ground truth.
+
+### Problems With The Old Model
+
+That design had a few structural weaknesses:
+
+- It depended on a file-wide prescan pass before useful decode work could start.
+- It relied on an amplitude/envelope-style field detector that was not well aligned with the
+  later sync/line-location logic.
+- More fundamentally, it depended on artifacts specific to the VCR/capture chain being used.
+  The old prescan was effectively using head-switching artifact pulses in the raw RF as a proxy
+  for true sync timing. That happened to work on the original test setup, where those pulses
+  came through clearly enough to detect. On captures from a different setup, it could fail
+  completely: zero "sync" pulses found, immediate decode failure.
+- The suspected reason is that those proxy pulses are highly front-end dependent. A different
+  VCR alignment, different analog conditioning, or something as simple as a larger inline
+  capacitor raising the effective high-pass floor can suppress or reshape the head-switching
+  disturbance enough that the prescan sees nothing usable.
+- In other words, the old method was not detecting a robust video invariant. It was detecting a
+  hardware-specific side effect and assuming it would always be present.
+- It split field-boundary discovery and real decode into two different systems, which made
+  debugging harder when the prescan and in-field sync interpretation disagreed.
+- It was less natural for future streaming support, because the field table wanted the whole
+  file up front.
+
+### New Architecture
+
+The current pipeline is demod-first and chunk-local:
+
+1. Read a contiguous raw chunk.
+2. FM-demod the chunk immediately (`fm_demod(...)`).
+3. Discover VSYNC candidates directly in the clean sync demod domain using
+   `discover_vsyncs(...)`.
+4. Cluster those candidates into chunk-local field starts.
+5. Re-run pulse extraction (`sync_pulses(...)`) at the detected field boundaries.
+6. Run host-side K2b pulse validation / vblank anchoring / lineloc generation.
+7. Refine HSYNC, resample luma, decode chroma, detect/correct dropouts.
+8. Use a small stitched look-back margin so the next chunk overlaps safely with the current one.
+
+The important architectural change is that **field discovery now happens inside the main decode
+pipeline, after demodulation, not in a separate prescan subsystem before decode**.
+
+### Code-Level Changes
+
+Key signs of the new architecture in the current code:
+
+- `src/pipeline/pipeline.h`
+  - old: `prescan_field_boundaries()` + `process_batch()`
+  - new: `prescan_via_demod()` comment remains for historical context, but the active runtime
+    path is `process_chunk(...)`
+- `src/pipeline/pipeline.cu`
+  - old: precompute `field_offsets`, then decode by field index
+  - new: `process_chunk()` demods first, runs `discover_vsyncs()`, clusters local field starts,
+    re-runs K2 on those starts, then continues through K2b/K4/K5/chroma/dropout
+- `src/pipeline/vsync_discover.cu`
+  - new kernel for demod-domain VSYNC candidate discovery
+- `src/pipeline/fm_demod.cu`
+  - overlap-save rewrite became part of the demod-first stable path
+
+### Why This Was The Right Move
+
+This change unified field discovery with the actual decoded sync domain and made the later
+pipeline stages operate on boundaries derived from the same demod signal they ultimately use.
+
+In practice, this architecture:
+
+- reduced disagreement between “where prescan thinks a field starts” and “where K2/K3/K2b think sync lives”
+- made the black-streak investigation tractable, because field discovery and line mapping were
+  now part of one continuous chain
+- positioned the codebase better for future streaming input support
+- eliminated the old hard distinction between “prescan architecture” and “real decode architecture”
+
+### Result
+
+The current healthy baseline is built on this demod-first architecture. The later K2b work,
+FM demod overlap-save rewrite, black-streak disappearance, and final line-origin fix all
+landed on top of this shift.
+
+---
+
+## Host-Side K2b Sync/Anchor Pipeline (2026-03-30 to 2026-03-31)
+
+### Motivation
+
+The original CUDA K3 path was too trusting of raw threshold pulses. On difficult captures it
+could still produce local long/short line pairs that sampled into sync within active picture,
+causing short moving black streaks.
+
+Repeated debugging showed:
+
+- K5 was exposing the problem, not causing it
+- K4 refinement was not the primary source
+- raw K2 pulse runs were often noisy, fragmented, or cadence-ambiguous
+- a richer validation/anchoring stage was needed before final line mapping
+
+### What was added
+
+A host-side `K2b` path was introduced in `src/pipeline/pipeline.cu`, enabled by default
+unless `CUVHS_K2B_DISABLE` is set.
+
+It now performs:
+
+1. pulse refinement / validation from raw K2 pulse runs
+2. vblank-aware field anchoring
+3. mean line-length estimation from trusted pulse runs
+4. validated-pulse-to-lineloc mapping
+5. per-field cadence state carry between processed fields
+
+Key components now present:
+
+- `host_refine_pulses_exactish(...)`
+- `host_get_first_hsync_loc_exactish(...)`
+- `host_valid_pulses_to_linelocs_exactish(...)`
+
+### Result
+
+This did not, by itself, finish the black-streak fix, but it materially improved geometry
+stability and became the new baseline that all later fixes built on.
+
+Compared with the older raw-K3-driven path, the stable K2b baseline reduced active-picture
+sync-hit counts substantially and eliminated a number of catastrophic mistrack cases during
+investigation.
+
+### Notes
+
+Many exploratory K2/K3 heuristic experiments were tried and discarded. This entry documents
+the surviving architectural change: validated host-side sync/anchor/lineloc generation before
+final refinement and TBC resampling.
+
+---
+
+## FM Demod Overlap-Save Rewrite (2026-03-30)
+
+### Symptom / Motivation
+
+The previous FM demod path was vulnerable to FFT edge contamination at field boundaries.
+During the black-streak investigation, one of the strongest correlations with improved output
+quality was the newer overlap-save demod path.
+
+### Change
+
+`src/pipeline/fm_demod.cu` was reworked to use an overlap-save style window with a fixed
+trash zone:
+
+```cpp
+static const int OVERLAP_SAMPLES = 2048;
+```
+
+Key changes include:
+
+- shifting per-field FFT input windows backward by the overlap amount
+- trimming the overlap region back off after transform-domain processing
+- keeping unwrap/envelope/filter stages aligned to the overlap-adjusted indexing
+- moving to the newer FFT-friendly size selection (`next_fft_size(...)`)
+
+### Result
+
+This rewrite became part of the healthy-state baseline where the previously-persistent field-93
+black streak benchmark disappeared.
+
+The exact contribution relative to K2b was not isolated conclusively, but the overlap-save
+demod path is now part of the working solution set and should be treated as significant.
+
+---
+
+## Black Streak Investigation Outcome (2026-03-30 to 2026-03-31)
+
+### Symptom
+
+Short horizontal black streaks appeared in active picture and moved in a scanning pattern over
+time. A confirmed benchmark case was:
+
+- field `93`
+- `y = 127`
+- darkest head near `x = 391..392`
+
+### What was ruled out
+
+- not a true tape dropout
+- not K5 out-of-bounds fallback
+- not primarily caused by K4 refinement
+
+### What was learned
+
+- Some streaks were true sync-threshold hits in active picture.
+- Others were near-sync / dark aberrations that did not cross the exact threshold.
+- K3/K2 cadence ambiguity and demod/sync quality were both implicated during the investigation.
+
+### Current outcome
+
+The persistent benchmark black streaks disappeared in the current healthy baseline reached
+before the line-origin fix.
+
+The exact single root cause was not isolated with certainty, but the working state includes:
+
+- the host-side K2b validation/anchoring pipeline
+- the overlap-save FM demod rewrite
+
+The final line-origin fix documented above then corrected the remaining vertical wrap issue
+that had become visible after the streaks were gone.
+
+### Benchmark note
+
+Field-93 benchmark vectors and ROI notes were recorded separately in this logbook during the
+investigation and can still be used if future regressions reintroduce the streak.

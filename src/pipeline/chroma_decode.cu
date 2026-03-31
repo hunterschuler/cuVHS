@@ -104,7 +104,9 @@ __global__ void k_resample_raw_het(
     int field = abs_line / output_field_lines;
     int out_line = abs_line % output_field_lines;
 
-    int ll_line = out_line + active_line_start;
+    // Use the same full-field row mapping as luma resampling. Offsetting by
+    // active_line_start here misaligns chroma vertically against the luma TBC.
+    int ll_line = out_line;
     int ll_next = ll_line + 1;
     int ll_base = field * lines_per_frame;
 

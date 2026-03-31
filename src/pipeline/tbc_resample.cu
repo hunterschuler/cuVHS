@@ -54,8 +54,11 @@ __global__ void k_tbc_resample(
     int out_line = rem / output_line_len;
     int out_col = rem % output_line_len;
 
-    // Map output line to linelocs line (skip vblank)
-    int ll_line = out_line + active_line_start;
+    // Map output row directly to the field's line index. The lineloc grid
+    // already represents the full field; adding active_line_start here shifts
+    // the raster down and wraps the top-of-field non-picture region to the
+    // bottom of the 263-line output.
+    int ll_line = out_line;
     int ll_next = ll_line + 1;
 
     // Bounds check on linelocs
