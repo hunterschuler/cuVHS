@@ -362,20 +362,86 @@ __global__ void k_compute_linelocs(
         // num_hsyncs filled below
     }
 
-    // Build a compact list of HSYNC-only pulse starts for matching
-    // (skip EQ/VSYNC pulses since they're at half-line intervals)
+    // Build a compact list of line-marker pulses for matching.
+    //
+    // Some troublesome captures produce an `EQ`-width pulse at the correct
+    // line cadence followed immediately by a tiny bogus `H` fragment. If we
+    // skip the EQ pulse and keep the tiny H fragment, the coarse linelocs turn
+    // into the long-line / short-line zig-zag seen in active picture streaks.
+    //
+    // To stabilize this, promote `EQ1/EQ2` pulses that are immediately
+    // followed by a tiny HSYNC fragment into the HSYNC candidate list, and
+    // suppress the tiny fragment itself.
+    int marker_starts[800];
+    int marker_lengths[800];
+    int marker_count = 0;
+    double tiny_hsync_max = hsync_nominal * 0.75;
+    double surrogate_gap_max = inlinelen * 0.25;
+    for (int i = 0; i < npc_clamped && marker_count < 800; i++) {
+        bool surrogate_eq = false;
+        if ((types[i] == PULSE_EQ1 || types[i] == PULSE_EQ2) &&
+            i + 1 < npc_clamped &&
+            types[i + 1] == PULSE_HSYNC &&
+            (double)lengths[i + 1] <= tiny_hsync_max &&
+            (double)(starts[i + 1] - starts[i]) <= surrogate_gap_max) {
+            surrogate_eq = true;
+        }
+
+        bool suppress_tiny_hsync = false;
+        if (types[i] == PULSE_HSYNC &&
+            (double)lengths[i] <= tiny_hsync_max &&
+            i > 0 &&
+            (types[i - 1] == PULSE_EQ1 || types[i - 1] == PULSE_EQ2) &&
+            (double)(starts[i] - starts[i - 1]) <= surrogate_gap_max) {
+            suppress_tiny_hsync = true;
+        }
+
+        if (surrogate_eq) {
+            marker_starts[marker_count] = starts[i];
+            marker_lengths[marker_count] = lengths[i];
+            marker_count++;
+        } else if (types[i] == PULSE_HSYNC && !suppress_tiny_hsync) {
+            marker_starts[marker_count] = starts[i];
+            marker_lengths[marker_count] = lengths[i];
+            marker_count++;
+        }
+    }
+
+    // Collapse near-duplicate HSYNC markers inside the same line interval.
+    // Keep the pulse whose width is closest to nominal HSYNC width; that
+    // favors the full-width marker and drops tiny trailing fragments.
     int hsync_starts[800];  // local array — fits in registers/local mem
     int num_hsyncs = 0;
-    for (int i = 0; i < npc_clamped && num_hsyncs < 800; i++) {
-        if (types[i] == PULSE_HSYNC) {
-            hsync_starts[num_hsyncs++] = starts[i];
+    double duplicate_gap_max = inlinelen * 0.75;
+    int cluster_start = 0;
+    while (cluster_start < marker_count && num_hsyncs < 800) {
+        int best_idx = cluster_start;
+        double best_score = fabs((double)marker_lengths[cluster_start] - hsync_nominal);
+        int cluster_end = cluster_start + 1;
+        while (cluster_end < marker_count &&
+               (double)(marker_starts[cluster_end] - marker_starts[cluster_start]) < duplicate_gap_max) {
+            double score = fabs((double)marker_lengths[cluster_end] - hsync_nominal);
+            if (score < best_score ||
+                (score == best_score && marker_starts[cluster_end] < marker_starts[best_idx])) {
+                best_idx = cluster_end;
+                best_score = score;
+            }
+            cluster_end++;
         }
+        hsync_starts[num_hsyncs++] = marker_starts[best_idx];
+        cluster_start = cluster_end;
     }
 
     if (k3_debug) k3_debug[field].num_hsyncs = num_hsyncs;
 
     double max_allowed_distance = meanlinelen / 1.5;
     int cur_hsync = 0;  // monotonic cursor into hsync_starts
+    double worst_match_dist[8];
+    int worst_match_lines[8];
+    for (int i = 0; i < 8; i++) {
+        worst_match_dist[i] = -1.0;
+        worst_match_lines[i] = -1;
+    }
 
     for (int line = 0; line < lines_per_frame; line++) {
         // Expected position
@@ -409,6 +475,63 @@ __global__ void k_compute_linelocs(
         if (best_pos >= 0) {
             locs[line] = (double)best_pos;
             cur_hsync++;  // consume this pulse
+        }
+
+        double match_score = (best_pos >= 0) ? best_dist : max_allowed_distance;
+
+        if (line >= 16) {
+            for (int slot = 0; slot < 8; slot++) {
+                if (match_score > worst_match_dist[slot]) {
+                    for (int move = 7; move > slot; move--) {
+                        worst_match_dist[move] = worst_match_dist[move - 1];
+                        worst_match_lines[move] = worst_match_lines[move - 1];
+                    }
+                    worst_match_dist[slot] = match_score;
+                    worst_match_lines[slot] = line;
+                    break;
+                }
+            }
+        }
+    }
+
+    if (k3_debug) {
+        K3Debug& dbg = k3_debug[field];
+        dbg.bad_spacing_count = 0;
+        dbg.isolated_spacing_count = 0;
+        dbg.large_jump_count = 0;
+        dbg.min_spacing = 1.0e30;
+        dbg.max_spacing = -1.0e30;
+        for (int i = 0; i < 8; i++) dbg.bad_lines[i] = -1;
+        for (int i = 0; i < 8; i++) {
+            dbg.worst_match_dist[i] = worst_match_dist[i];
+            dbg.worst_match_lines[i] = worst_match_lines[i];
+        }
+
+        int bad_line_write = 0;
+        for (int line = 0; line + 1 < lines_per_frame; line++) {
+            double spacing = locs[line + 1] - locs[line];
+            if (spacing < dbg.min_spacing) dbg.min_spacing = spacing;
+            if (spacing > dbg.max_spacing) dbg.max_spacing = spacing;
+
+            bool bad_spacing = (line >= lines_per_frame / 20) &&
+                               (spacing < inlinelen * 0.9 || spacing > inlinelen * 1.1);
+            if (bad_spacing) {
+                dbg.bad_spacing_count++;
+                if (bad_line_write < 8) dbg.bad_lines[bad_line_write++] = line;
+            }
+
+            if (fabs(spacing - inlinelen) > 0.25 * inlinelen) {
+                dbg.large_jump_count++;
+            }
+
+            if (line > lines_per_frame / 20 && line + 2 < lines_per_frame) {
+                double prev_spacing = locs[line] - locs[line - 1];
+                double next_spacing = locs[line + 2] - locs[line + 1];
+                double neighbor_avg = 0.5 * (prev_spacing + next_spacing);
+                if (fabs(spacing - neighbor_avg) > 0.15 * inlinelen) {
+                    dbg.isolated_spacing_count++;
+                }
+            }
         }
     }
 }
@@ -467,4 +590,64 @@ void line_locs(const int* d_pulse_starts,
             fmt.samples_per_field,
             fmt.system == VideoSystem::NTSC);
     }
+}
+
+__global__ void k_line_locs_debug_analyze(
+    const double* __restrict__ linelocs,
+    int* __restrict__ bad_spacing_count,
+    int* __restrict__ isolated_spacing_count,
+    int* __restrict__ large_jump_count,
+    int num_fields,
+    int lines_per_frame,
+    int active_line_start,
+    double nominal_spacing)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_lines = num_fields * (lines_per_frame - 1);
+    if (idx >= total_lines) return;
+
+    int field = idx / (lines_per_frame - 1);
+    int line = idx % (lines_per_frame - 1);
+    if (line < active_line_start || line + 1 >= lines_per_frame) return;
+
+    int base = field * lines_per_frame;
+    double spacing = linelocs[base + line + 1] - linelocs[base + line];
+    if (spacing < 0.9 * nominal_spacing || spacing > 1.1 * nominal_spacing) {
+        atomicAdd(bad_spacing_count, 1);
+    }
+
+    double large_jump_threshold = 0.25 * nominal_spacing;
+    if (fabs(spacing - nominal_spacing) > large_jump_threshold) {
+        atomicAdd(large_jump_count, 1);
+    }
+
+    if (line > active_line_start && line + 2 < lines_per_frame) {
+        double prev_spacing = linelocs[base + line] - linelocs[base + line - 1];
+        double next_spacing = linelocs[base + line + 2] - linelocs[base + line + 1];
+        double neighbor_avg = 0.5 * (prev_spacing + next_spacing);
+        if (fabs(spacing - neighbor_avg) > 0.15 * nominal_spacing) {
+            atomicAdd(isolated_spacing_count, 1);
+        }
+    }
+}
+
+void line_locs_debug_analyze(const double* d_linelocs,
+                             int* d_bad_spacing_count,
+                             int* d_isolated_spacing_count,
+                             int* d_large_jump_count,
+                             int num_fields,
+                             const VideoFormat& fmt)
+{
+    int total = num_fields * (fmt.lines_per_frame - 1);
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    k_line_locs_debug_analyze<<<blocks, threads>>>(
+        d_linelocs,
+        d_bad_spacing_count,
+        d_isolated_spacing_count,
+        d_large_jump_count,
+        num_fields,
+        fmt.lines_per_frame,
+        fmt.active_line_start,
+        fmt.samples_per_line);
 }

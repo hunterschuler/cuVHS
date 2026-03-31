@@ -20,3 +20,13 @@ void hsync_refine(const double* d_demod_05,
                   int num_fields,
                   int total_demod_samples,
                   const VideoFormat& fmt);
+
+void hsync_refine_debug_analyze(const double* d_demod_05,
+                                const double* d_linelocs_before,
+                                const double* d_linelocs_after,
+                                int* d_large_delta_count,
+                                int* d_isolated_jump_count,
+                                int* d_refined_sync_like_count,
+                                int num_fields,
+                                int total_demod_samples,
+                                const VideoFormat& fmt);

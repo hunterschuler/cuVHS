@@ -798,39 +798,91 @@ void chroma_decode(const double* d_raw,
     chunk_lines = (chunk_lines / output_field_lines) * output_field_lines;
     if (chunk_lines < output_field_lines) chunk_lines = output_field_lines;
 
-    int fields_per_chunk = chunk_lines / output_field_lines;
-
-    // Allocate temp buffers
+    // Allocate temp buffers with backoff. The initial estimate only accounts
+    // for the het/FFT buffers themselves; cuFFT plan workspace and allocator
+    // overhead can still push us over the edge.
     double* d_het_buf = nullptr;
     cufftDoubleComplex* d_fft_buf = nullptr;
     double* d_metrics = nullptr;
-
-    size_t het_bytes = (size_t)chunk_lines * fft_size * sizeof(double);
-    size_t fft_bytes = (size_t)chunk_lines * freq_bins * sizeof(cufftDoubleComplex);
-
-    cudaError_t err;
-    err = cudaMalloc(&d_het_buf, het_bytes);
-    if (err != cudaSuccess) {
-        fprintf(stderr, "  [chroma] Failed to alloc het buffer: %s\n", cudaGetErrorString(err));
-        cudaFree(d_field_track); cudaFree(d_field_phase_offset);
-        return;
-    }
-    err = cudaMalloc(&d_fft_buf, fft_bytes);
-    if (err != cudaSuccess) {
-        fprintf(stderr, "  [chroma] Failed to alloc FFT buffer: %s\n", cudaGetErrorString(err));
-        cudaFree(d_het_buf); cudaFree(d_field_track); cudaFree(d_field_phase_offset);
-        return;
-    }
-    cudaMalloc(&d_metrics, fields_per_chunk * sizeof(double));
     int* d_first_bad = nullptr;
-    cudaMalloc(&d_first_bad, sizeof(int));
-
-    // Create cuFFT plans
     cufftHandle plan_r2c = 0, plan_c2r = 0;
     int n[] = { fft_size };
+    int fields_per_chunk = 0;
 
-    cufftPlanMany(&plan_r2c, 1, n, NULL, 1, fft_size, NULL, 1, freq_bins, CUFFT_D2Z, chunk_lines);
-    cufftPlanMany(&plan_c2r, 1, n, NULL, 1, freq_bins, NULL, 1, fft_size, CUFFT_Z2D, chunk_lines);
+    while (chunk_lines >= output_field_lines) {
+        fields_per_chunk = chunk_lines / output_field_lines;
+        size_t het_bytes = (size_t)chunk_lines * fft_size * sizeof(double);
+        size_t fft_bytes = (size_t)chunk_lines * freq_bins * sizeof(cufftDoubleComplex);
+
+        cudaError_t err = cudaMalloc(&d_het_buf, het_bytes);
+        if (err != cudaSuccess) {
+            d_het_buf = nullptr;
+        } else {
+            err = cudaMalloc(&d_fft_buf, fft_bytes);
+            if (err != cudaSuccess) {
+                cudaFree(d_het_buf);
+                d_het_buf = nullptr;
+                d_fft_buf = nullptr;
+            } else {
+                err = cudaMalloc(&d_metrics, fields_per_chunk * sizeof(double));
+                if (err != cudaSuccess) {
+                    cudaFree(d_fft_buf);
+                    cudaFree(d_het_buf);
+                    d_het_buf = nullptr;
+                    d_fft_buf = nullptr;
+                    d_metrics = nullptr;
+                } else {
+                    err = cudaMalloc(&d_first_bad, sizeof(int));
+                    if (err != cudaSuccess) {
+                        cudaFree(d_metrics);
+                        cudaFree(d_fft_buf);
+                        cudaFree(d_het_buf);
+                        d_het_buf = nullptr;
+                        d_fft_buf = nullptr;
+                        d_metrics = nullptr;
+                        d_first_bad = nullptr;
+                    } else {
+                        if (cufftPlanMany(&plan_r2c, 1, n, NULL, 1, fft_size, NULL, 1, freq_bins,
+                                          CUFFT_D2Z, chunk_lines) == CUFFT_SUCCESS &&
+                            cufftPlanMany(&plan_c2r, 1, n, NULL, 1, freq_bins, NULL, 1, fft_size,
+                                          CUFFT_Z2D, chunk_lines) == CUFFT_SUCCESS) {
+                            break;
+                        }
+                        if (plan_r2c) cufftDestroy(plan_r2c);
+                        if (plan_c2r) cufftDestroy(plan_c2r);
+                        plan_r2c = 0;
+                        plan_c2r = 0;
+                        cudaFree(d_first_bad);
+                        cudaFree(d_metrics);
+                        cudaFree(d_fft_buf);
+                        cudaFree(d_het_buf);
+                        d_het_buf = nullptr;
+                        d_fft_buf = nullptr;
+                        d_metrics = nullptr;
+                        d_first_bad = nullptr;
+                    }
+                }
+            }
+        }
+
+        int next_fields = std::max(1, fields_per_chunk / 2);
+        int next_chunk_lines = next_fields * output_field_lines;
+        if (next_chunk_lines == chunk_lines) break;
+        chunk_lines = next_chunk_lines;
+    }
+
+    if (!d_het_buf || !d_fft_buf || !d_metrics || !d_first_bad || !plan_r2c || !plan_c2r) {
+        fprintf(stderr, "  [chroma] Failed to allocate temp buffers/plans even at one-field chunk size\n");
+        if (plan_r2c) cufftDestroy(plan_r2c);
+        if (plan_c2r) cufftDestroy(plan_c2r);
+        if (d_first_bad) cudaFree(d_first_bad);
+        if (d_metrics) cudaFree(d_metrics);
+        if (d_fft_buf) cudaFree(d_fft_buf);
+        if (d_het_buf) cudaFree(d_het_buf);
+        cudaFree(d_field_track);
+        cudaFree(d_field_phase_offset);
+        return;
+    }
 
     for (int field_start = 0; field_start < num_fields; field_start += fields_per_chunk) {
         int fields_this = std::min(fields_per_chunk, num_fields - field_start);

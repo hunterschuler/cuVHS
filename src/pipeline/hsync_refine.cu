@@ -269,3 +269,81 @@ void hsync_refine(const double* d_demod_05,
         fmt.hsync_width,
         right_edge_offset);
 }
+
+__global__ void k_hsync_refine_debug_analyze(
+    const double* __restrict__ demod_05,
+    const double* __restrict__ before,
+    const double* __restrict__ after,
+    int* __restrict__ large_delta_count,
+    int* __restrict__ isolated_jump_count,
+    int* __restrict__ refined_sync_like_count,
+    int num_fields,
+    int lines_per_frame,
+    int total_demod_samples,
+    int active_line_start,
+    double pulse_threshold_hz,
+    double large_delta_threshold,
+    double isolated_delta_threshold)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_lines = num_fields * lines_per_frame;
+    if (idx >= total_lines) return;
+
+    int field = idx / lines_per_frame;
+    int line = idx % lines_per_frame;
+    if (line < active_line_start || line + 1 >= lines_per_frame) return;
+
+    int base = field * lines_per_frame;
+    double before_loc = before[base + line];
+    double after_loc = after[base + line];
+    double delta = after_loc - before_loc;
+
+    if (fabs(delta) > large_delta_threshold) {
+        atomicAdd(large_delta_count, 1);
+    }
+
+    if (line > active_line_start && line + 1 < lines_per_frame) {
+        double prev_delta = after[base + line - 1] - before[base + line - 1];
+        double next_delta = after[base + line + 1] - before[base + line + 1];
+        double neighbor_avg = 0.5 * (prev_delta + next_delta);
+        if (fabs(delta - neighbor_avg) > isolated_delta_threshold) {
+            atomicAdd(isolated_jump_count, 1);
+        }
+    }
+
+    int sample = (int)(after_loc + 0.5);
+    if (sample >= 0 && sample < total_demod_samples && demod_05[sample] <= pulse_threshold_hz) {
+        atomicAdd(refined_sync_like_count, 1);
+    }
+}
+
+void hsync_refine_debug_analyze(const double* d_demod_05,
+                                const double* d_linelocs_before,
+                                const double* d_linelocs_after,
+                                int* d_large_delta_count,
+                                int* d_isolated_jump_count,
+                                int* d_refined_sync_like_count,
+                                int num_fields,
+                                int total_demod_samples,
+                                const VideoFormat& fmt)
+{
+    int total_lines = num_fields * fmt.lines_per_frame;
+    int threads = 256;
+    int blocks = (total_lines + threads - 1) / threads;
+    double one_usec_samples = 1.0e-6 * fmt.sample_rate;
+
+    k_hsync_refine_debug_analyze<<<blocks, threads>>>(
+        d_demod_05,
+        d_linelocs_before,
+        d_linelocs_after,
+        d_large_delta_count,
+        d_isolated_jump_count,
+        d_refined_sync_like_count,
+        num_fields,
+        fmt.lines_per_frame,
+        total_demod_samples,
+        fmt.active_line_start,
+        fmt.pulse_threshold_hz,
+        1.5 * one_usec_samples,
+        1.0 * one_usec_samples);
+}

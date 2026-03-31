@@ -62,10 +62,23 @@ private:
     void* d_candidate_count = nullptr;   // Global candidate counter (1 int)
     
     void* d_linelocs = nullptr;    // line locations (batch)
+    void* d_linelocs_coarse = nullptr;  // K4 debug: pre-refine line locations
     void* d_envelope = nullptr;    // RF envelope magnitude (float64, batch)
     void* d_tbc_luma = nullptr;    // TBC luma output (uint16, batch)
     void* d_tbc_chroma = nullptr;  // TBC chroma output (uint16, batch)
     void* d_is_first_field = nullptr;  // field parity from VSYNC pulse pattern (int, batch)
+    void* d_k3_bad_spacing_count = nullptr;      // K3 debug: line spacings outside tolerance
+    void* d_k3_isolated_spacing_count = nullptr; // K3 debug: spacing differs from neighbors
+    void* d_k3_large_jump_count = nullptr;       // K3 debug: adjacent lineloc jump > threshold
+    void* d_k4_large_delta_count = nullptr;    // K4 debug: lines moved by > threshold
+    void* d_k4_isolated_jump_count = nullptr;  // K4 debug: line moved differently from neighbors
+    void* d_k4_refined_sync_like_count = nullptr; // K4 debug: refined location lands in sync-like region
+    void* d_k5_coarse_bad_geom_line_count = nullptr; // K5 debug: coarse-lineloc suspicious geometry count
+    void* d_k5_coarse_sync_like_pixel_count = nullptr; // K5 debug: coarse-lineloc active-picture sync-like pixels
+    void* d_k5_oob_pixel_count = nullptr;   // K5 debug: OOB fallback pixel count
+    void* d_k5_bad_geom_line_count = nullptr; // K5 debug: suspicious lineloc geometry count
+    void* d_k5_sync_like_pixel_count = nullptr; // K5 debug: in-bounds sync-like pixels
+    void* d_k5_sync_like_line_counts = nullptr; // K5 debug: per-line active-picture sync-like counts
 
     // Kernel 7: Dropout detection output (TBC-mapped dropout entries)
     void* d_do_lines = nullptr;    // dropout line indices (batch x MAX_DROPOUTS_PER_FIELD)
@@ -75,6 +88,13 @@ private:
 
     // Pre-scanned field start offsets (sample positions in raw file)
     std::vector<size_t> field_offsets;
+
+    // Host-side K2b cadence state carried across processed fields.
+    int k2b_prev_first_field = -1;
+    int k2b_prev_progressive_field = -1;
+    long long k2b_prev_first_hsync_readloc = -1;
+    double k2b_prev_first_hsync_loc = -1.0;
+    double k2b_prev_first_hsync_diff = -1.0;
 
     size_t bytes_per_field() const;
     bool allocate_buffers();

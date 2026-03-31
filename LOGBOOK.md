@@ -423,6 +423,62 @@ Decode complete: 598 fields in 7.5 seconds (39.9 FPS)
 
 ### Next Steps
 
+### Field 93 Streak Benchmark
+
+Pinned ROI for the remaining active-picture streak:
+
+- Field: `93`
+- Row: `y=127` (`0` = top of field)
+- ROI: `x=377..420`
+- Darkest confirmed head of streak: `x=391..392`
+
+Reference clean neighbor for comparison:
+
+- Field: `92`
+- Same ROI: `y=127, x=377..420`
+
+Raw TBC vectors captured from:
+
+- Field 92 from `TAPE1_k2b_dedupeprobe.tbc`
+- Field 93 from fresh untampered `TAPE1_field93_freshcompare.tbc`
+
+Field 92 luma (`l92`):
+```text
+[21637, 21798, 21921, 21977, 21953, 21856, 21706, 21538, 21390, 21299, 21288, 21361, 21501, 21676, 21846, 21978, 22054, 22076, 22061, 22026, 21983, 21929, 21854, 21748, 21615, 21476, 21367, 21323, 21368, 21500, 21692, 21903, 22091, 22225, 22290, 22285, 22217, 22098, 21940, 21763, 21592, 21459, 21390, 21401]
+```
+
+Field 92 chroma (`c92`):
+```text
+[33491, 33981, 32073, 31587, 33436, 33920, 32123, 31635, 33393, 33894, 32159, 31636, 33363, 33918, 32185, 31592, 33339, 33973, 32209, 31538, 33313, 34014, 32239, 31520, 33280, 34003, 32274, 31561, 33245, 33935, 32305, 31648, 33221, 33840, 32318, 31739, 33223, 33767, 32300, 31783, 33259, 33759, 32245, 31753]
+```
+
+Field 93 luma (`l93`):
+```text
+[21752, 21839, 21993, 22184, 22379, 22545, 22655, 22685, 22617, 22444, 22181, 21870, 21576, 21376, 21334, 21475, 21766, 22124, 22434, 22593, 22545, 22303, 21939, 21561, 21274, 21143, 21181, 21349, 21583, 21815, 22000, 22123, 22197, 22248, 22297, 22346, 22376, 22356, 22256, 22067, 21816, 21558, 21362, 21288]
+```
+
+Field 93 chroma (`c93`):
+```text
+[32122, 33105, 33377, 32316, 32190, 33324, 33320, 32132, 32236, 33458, 33286, 32051, 32258, 33492, 33273, 32047, 32266, 33488, 33270, 32037, 32265, 33529, 33275, 31954, 32253, 33655, 33298, 31795, 32214, 33829, 33358, 31628, 32130, 33964, 33465, 31547, 32003, 33976, 33606, 31612, 31860, 33838, 33739, 31810]
+```
+
+Field 93 minus field 92 luma:
+```text
+[115, 41, 72, 207, 426, 689, 949, 1147, 1227, 1145, 893, 509, 75, -300, -512, -503, -288, 48, 373, 567, 562, 374, 85, -187, -341, -333, -186, 26, 215, 315, 308, 220, 106, 23, 7, 61, 159, 258, 316, 304, 224, 99, -28, -113]
+```
+
+Confirmed darkest “head” run:
+
+- ROI-relative indices `14..15`
+- Absolute `x=391..392`
+- Luma diff `[-512, -503]`
+
+Interpretation:
+
+- The visible field 93 streak is a short luma notch centered at `y=127, x=391..392`.
+- The earlier pixels around `x≈377..384` are the visible lead-in to the streak.
+- The rightward tail is weaker and looks more like mild luma/chroma aberration than a hard black dropout.
+
 1. Validate K1 output against Python vhs-decode reference (PSNR comparison)
 2. ~~Implement K2 (sync pulse detection) — consumes d_demod_05~~ **Done**
 3. Parameterize filters for PAL and tape speed (currently hardcoded NTSC SP)

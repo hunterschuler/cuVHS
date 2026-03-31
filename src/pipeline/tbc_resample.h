@@ -16,6 +16,12 @@
 void tbc_resample(const double* d_demod,
                   const double* d_linelocs,
                   uint16_t* d_tbc_luma,
+                  int* d_oob_pixel_count,       // optional debug counter
+                  int* d_bad_geom_line_count,   // optional debug counter
+                  int* d_sync_like_pixel_count, // optional debug counter
+                  int* d_sync_like_line_counts, // optional [num_fields x output_field_lines]
+                  bool mark_fallback_white,     // optional debug visualization
+                  bool mark_sync_like_white,    // optional debug visualization
                   int num_fields,
                   int total_demod_samples,
                   const VideoFormat& fmt);

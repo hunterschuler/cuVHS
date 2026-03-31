@@ -37,6 +37,14 @@ struct K3Debug {
     double hsync_offset;    // adaptive classification shift from nominal
     int final_state;        // state machine final state (-1, HSYNC, EQ1, VSYNC, EQ2)
     int field_parity;       // 1=first, 0=second, -1=unknown
+    int bad_spacing_count;  // number of coarse line spacings outside tolerance
+    int isolated_spacing_count; // number of coarse spacings unlike neighbors
+    int large_jump_count;   // number of very large spacing errors
+    double min_spacing;     // smallest line-to-line spacing in samples
+    double max_spacing;     // largest line-to-line spacing in samples
+    int bad_lines[8];       // first few lines with out-of-tolerance spacing
+    double worst_match_dist[8]; // largest snap distances from expected position
+    int worst_match_lines[8];   // corresponding line indices
 };
 
 void line_locs(const int* d_pulse_starts,
@@ -48,3 +56,10 @@ void line_locs(const int* d_pulse_starts,
                int num_fields,
                const VideoFormat& fmt,
                K3Debug* d_k3_debug = nullptr);  // optional debug output
+
+void line_locs_debug_analyze(const double* d_linelocs,
+                             int* d_bad_spacing_count,
+                             int* d_isolated_spacing_count,
+                             int* d_large_jump_count,
+                             int num_fields,
+                             const VideoFormat& fmt);
