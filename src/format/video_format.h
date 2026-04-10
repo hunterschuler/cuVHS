@@ -2,15 +2,22 @@
 #include <cstdint>
 
 enum class VideoSystem { NTSC, PAL };
+enum class VideoProfile { NTSC_525_60_VHS, PAL_625_50_VHS, MPAL_525_60_VHS };
+enum class TapeSpeed { SP = 0, LP = 1, EP = 2 };
 enum class InputFormat { U8, S16, U16 };
 
 const char* input_format_name(InputFormat fmt);
 int input_format_bytes_per_sample(InputFormat fmt);
+const char* video_profile_name(VideoProfile profile);
+VideoSystem video_system_from_profile(VideoProfile profile);
+const char* tape_speed_name(TapeSpeed speed);
 
 // All the timing/frequency constants needed by the pipeline.
 // Derived at construction from system + sample_rate.
 struct VideoFormat {
+    VideoProfile profile;
     VideoSystem system;
+    TapeSpeed tape_speed;
     double sample_rate;          // Hz (e.g., 28e6)
 
     // Line and field geometry
@@ -64,6 +71,6 @@ struct VideoFormat {
     double burst_start_us;       // burst window start (µs after line start)
     double burst_end_us;         // burst window end (µs after line start)
 
-    VideoFormat(VideoSystem sys, double sample_rate_mhz);
+    VideoFormat(VideoProfile profile, double sample_rate_mhz, TapeSpeed tape_speed = TapeSpeed::SP);
     void print_info() const;
 };

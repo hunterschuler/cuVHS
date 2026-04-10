@@ -49,7 +49,7 @@ private:
     std::string json_path;
     std::string luma_path;
     std::string chroma_path;
-    VideoFormat fmt = VideoFormat(VideoSystem::NTSC, 28.0);
+    VideoFormat fmt = VideoFormat(VideoProfile::NTSC_525_60_VHS, 28.0);
 
     int field_count = 0;
 

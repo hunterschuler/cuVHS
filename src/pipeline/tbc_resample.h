@@ -15,6 +15,7 @@
 // N_fields × output_line_len × output_field_lines = ~160M samples for batch of 64.
 void tbc_resample(const double* d_demod,
                   const double* d_linelocs,
+                  const double* d_level_adjust,
                   uint16_t* d_tbc_luma,
                   int* d_oob_pixel_count,       // optional debug counter
                   int* d_bad_geom_line_count,   // optional debug counter

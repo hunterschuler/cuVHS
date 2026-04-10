@@ -12,7 +12,8 @@
 struct Args {
     std::string input_path;      // "-" or empty for stdin
     std::string output_base;     // output prefix (writes .tbc, _chroma.tbc, .tbc.json)
-    VideoSystem system = VideoSystem::NTSC;
+    VideoProfile profile = VideoProfile::NTSC_525_60_VHS;
+    TapeSpeed tape_speed = TapeSpeed::SP;
     double sample_rate_mhz = 28.0;
     InputFormat input_format = InputFormat::U8;
     InputConditioning conditioning;
@@ -32,7 +33,10 @@ static void print_usage(const char* prog) {
         "  output_base      Output prefix (creates .tbc, _chroma.tbc, .tbc.json)\n"
         "\n"
         "Options:\n"
-        "  --system <NTSC|PAL>   Video system (default: NTSC)\n"
+        "  --system <NTSC|PAL|PAL-M|MPAL|NTSC_525_60_VHS|PAL_625_50_VHS|MPAL_525_60_VHS>\n"
+        "                        Video profile (default: NTSC)\n"
+        "  --tape-speed <sp|lp|ep>\n"
+        "                        VHS tape speed for filter selection (default: sp)\n"
         "  -f <MHz>              Sample rate in MHz (default: 28)\n"
         "  --format <u8|s16|u16> Input sample format (default: auto from extension)\n"
         "  --dc-correct          Subtract per-read DC offset after normalization\n"
@@ -50,9 +54,25 @@ static bool parse_args(int argc, char** argv, Args& args) {
             exit(0);
         } else if (strcmp(argv[i], "--system") == 0 && i + 1 < argc) {
             i++;
-            if (strcasecmp(argv[i], "NTSC") == 0) args.system = VideoSystem::NTSC;
-            else if (strcasecmp(argv[i], "PAL") == 0) args.system = VideoSystem::PAL;
+            if (strcasecmp(argv[i], "NTSC") == 0 ||
+                strcasecmp(argv[i], "NTSC_525_60_VHS") == 0) {
+                args.profile = VideoProfile::NTSC_525_60_VHS;
+            } else if (strcasecmp(argv[i], "PAL") == 0 ||
+                       strcasecmp(argv[i], "PAL_625_50_VHS") == 0) {
+                args.profile = VideoProfile::PAL_625_50_VHS;
+            } else if (strcasecmp(argv[i], "PAL-M") == 0 ||
+                       strcasecmp(argv[i], "PALM") == 0 ||
+                       strcasecmp(argv[i], "MPAL") == 0 ||
+                       strcasecmp(argv[i], "MPAL_525_60_VHS") == 0) {
+                args.profile = VideoProfile::MPAL_525_60_VHS;
+            }
             else { fprintf(stderr, "Unknown system: %s\n", argv[i]); return false; }
+        } else if (strcmp(argv[i], "--tape-speed") == 0 && i + 1 < argc) {
+            ++i;
+            if (strcasecmp(argv[i], "sp") == 0) args.tape_speed = TapeSpeed::SP;
+            else if (strcasecmp(argv[i], "lp") == 0) args.tape_speed = TapeSpeed::LP;
+            else if (strcasecmp(argv[i], "ep") == 0 || strcasecmp(argv[i], "slp") == 0) args.tape_speed = TapeSpeed::EP;
+            else { fprintf(stderr, "Unknown tape speed: %s\n", argv[i]); return false; }
         } else if (strcmp(argv[i], "-f") == 0 && i + 1 < argc) {
             args.sample_rate_mhz = atof(argv[++i]);
         } else if (strcmp(argv[i], "--format") == 0 && i + 1 < argc) {
@@ -112,7 +132,7 @@ int main(int argc, char** argv) {
     gpu.print_info();
 
     // Video format parameters
-    VideoFormat fmt(args.system, args.sample_rate_mhz);
+    VideoFormat fmt(args.profile, args.sample_rate_mhz, args.tape_speed);
     fmt.print_info();
 
     // Open input — stdin/pipe or file

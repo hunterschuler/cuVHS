@@ -15,6 +15,8 @@ __global__ void k_find_pulses(
     const size_t* field_offsets, // optional: per-field offsets (or nullptr for uniform stride)
     int samples_per_field,
     double threshold,            // pulse_threshold_hz: samples <= this are "in pulse"
+    int min_synclen,
+    int max_synclen,
     int max_pulses,
     int num_fields)
 {
@@ -37,9 +39,10 @@ __global__ void k_find_pulses(
         if (in_pulse) {
             if (val > threshold) {
                 int length = i - cur_start;
-                // Record pulse if length > 0 and not at sample 0
-                // (Python: "if cur_start != 0" — skip pulse starting at pos 0)
-                if (length > 0 && cur_start != 0 && count < max_pulses) {
+                // Match vhs-decode raw pulse finding:
+                // skip the pulse at sample 0 and only keep pulses in the valid length range.
+                if (length >= min_synclen && length <= max_synclen &&
+                    cur_start != 0 && count < max_pulses) {
                     starts[count]  = (int)(field_offset + cur_start);  // absolute position
                     lengths[count] = length;
                     count++;
@@ -68,6 +71,8 @@ void sync_pulses(const double* d_demod_05,
 {
     int threads = 256;
     int blocks = (num_fields + threads - 1) / threads;
+    int min_synclen = (int)(fmt.eq_pulse_width * 0.125);
+    int max_synclen = (int)(fmt.samples_per_line * 5);
 
     k_find_pulses<<<blocks, threads>>>(
         d_demod_05,
@@ -77,6 +82,8 @@ void sync_pulses(const double* d_demod_05,
         d_field_offsets,  // can be nullptr for uniform stride
         (int)samples_per_field,
         fmt.pulse_threshold_hz,
+        min_synclen,
+        max_synclen,
         MAX_PULSES,
         num_fields);
 }

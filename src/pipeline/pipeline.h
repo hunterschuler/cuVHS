@@ -52,6 +52,7 @@ private:
     void* d_raw = nullptr;         // raw input samples (batch)
     void* d_demod = nullptr;       // FM demod output (float64, batch)
     void* d_demod_05 = nullptr;    // sync demod output (float64, batch)
+    void* d_demod_burst = nullptr; // K1 chroma-under source (float64, batch)
     void* d_pulse_starts = nullptr;  // pulse start positions (batch x MAX_PULSES ints)
     void* d_pulse_lengths = nullptr; // pulse lengths (batch x MAX_PULSES ints)
     void* d_pulse_count = nullptr;   // pulse count per field (batch ints)
@@ -79,6 +80,7 @@ private:
     void* d_k5_bad_geom_line_count = nullptr; // K5 debug: suspicious lineloc geometry count
     void* d_k5_sync_like_pixel_count = nullptr; // K5 debug: in-bounds sync-like pixels
     void* d_k5_sync_like_line_counts = nullptr; // K5 debug: per-line active-picture sync-like counts
+    void* d_k5_level_adjust = nullptr;      // K5 wow-derived per-line level adjustment
 
     // Kernel 7: Dropout detection output (TBC-mapped dropout entries)
     void* d_do_lines = nullptr;    // dropout line indices (batch x MAX_DROPOUTS_PER_FIELD)

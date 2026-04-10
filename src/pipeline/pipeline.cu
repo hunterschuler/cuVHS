@@ -16,6 +16,9 @@
 #include <cmath>
 #include <cstdlib>
 #include <algorithm>
+#include <fstream>
+#include <string>
+#include <vector>
 
 // Which fields to dump (set via CUVHS_DUMP_FIELDS="0,28" env var, default: 0,28)
 static std::vector<int> get_dump_fields() {
@@ -37,6 +40,268 @@ static std::vector<int> get_dump_fields() {
 static bool env_flag_enabled(const char* name) {
     const char* env = getenv(name);
     return env && env[0] && strcmp(env, "0") != 0;
+}
+
+static const char* env_string(const char* name) {
+    const char* env = getenv(name);
+    return (env && env[0]) ? env : nullptr;
+}
+
+static bool write_f64_file(const std::string& path, const double* data, size_t count) {
+    std::ofstream out(path, std::ios::binary);
+    if (!out) return false;
+    out.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(count * sizeof(double)));
+    return out.good();
+}
+
+static bool write_i32_file(const std::string& path, const int* data, size_t count) {
+    std::ofstream out(path, std::ios::binary);
+    if (!out) return false;
+    out.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(count * sizeof(int)));
+    return out.good();
+}
+
+static double median_inplace(std::vector<double>& values) {
+    if (values.empty()) return 0.0;
+    const size_t mid = values.size() / 2;
+    std::nth_element(values.begin(), values.begin() + mid, values.end());
+    double med = values[mid];
+    if ((values.size() & 1U) == 0) {
+        std::nth_element(values.begin(), values.begin() + mid - 1, values.begin() + mid);
+        med = 0.5 * (med + values[mid - 1]);
+    }
+    return med;
+}
+
+static void compute_k5_level_adjust(const double* h_linelocs,
+                                    const int* h_is_first_field,
+                                    int fields_loaded,
+                                    const VideoFormat& fmt,
+                                    std::vector<double>* out) {
+    out->assign((size_t)fields_loaded * fmt.output_field_lines, 1.0);
+    if (fields_loaded <= 0) return;
+
+    for (int field = 0; field < fields_loaded; field++) {
+        const double* field_linelocs = h_linelocs + (size_t)field * fmt.lines_per_frame;
+        const bool is_first = h_is_first_field ? (h_is_first_field[field] == 1) : false;
+        const int lineoffset = (fmt.lines_per_frame == 525) ? (is_first ? 2 : 3) : 1;
+        std::vector<double> wow((size_t)fmt.output_field_lines + 1, 1.0);
+        for (int seg = 0; seg <= fmt.output_field_lines; seg++) {
+            int base = seg + lineoffset + 1;
+            int next = base + 1;
+            double w = 1.0;
+            if (base >= 0 && next < fmt.lines_per_frame) {
+                double line_len = field_linelocs[next] - field_linelocs[base];
+                if (std::isfinite(line_len) && line_len > 0.0) {
+                    w = line_len / (double)fmt.samples_per_line;
+                }
+            }
+            wow[(size_t)seg] = w;
+        }
+
+        std::vector<double> wow_copy = wow;
+        double med = median_inplace(wow_copy);
+        for (double& v : wow_copy) v = std::abs(v - med);
+        double mad = median_inplace(wow_copy);
+        double threshold = mad > 0.0 ? (15.0 * mad) : 0.001;
+
+        double* dst = out->data() + (size_t)field * fmt.output_field_lines;
+        for (int out_line = 0; out_line < fmt.output_field_lines; out_line++) {
+            double w = wow[(size_t)out_line + 1];
+            dst[out_line] = (std::abs(w - med) > threshold) ? med : w;
+        }
+    }
+}
+
+static bool rebuild_k4_sources_blockwise(const double* raw_with_context,
+                                         size_t total_samples_with_context,
+                                         size_t lead_samples,
+                                         const VideoFormat& fmt,
+                                         int fields_loaded,
+                                         size_t spf_padded,
+                                         double* d_demod_burst)
+{
+    const size_t total_samples = static_cast<size_t>(fields_loaded) * spf_padded;
+    if (!raw_with_context || fields_loaded <= 0 || total_samples == 0) return true;
+    std::vector<double> stitched_burst(total_samples, 0.0);
+    if (!demod_burst_cpu_windowed(raw_with_context,
+                                  total_samples_with_context,
+                                  lead_samples,
+                                  fields_loaded,
+                                  spf_padded,
+                                  fmt,
+                                  stitched_burst.data())) {
+        return false;
+    }
+
+    cudaMemcpy(d_demod_burst, stitched_burst.data(), total_samples * sizeof(double), cudaMemcpyHostToDevice);
+    return true;
+}
+
+static void maybe_dump_k2_chunk_field(const char* dump_dir,
+                                      size_t raw_offset,
+                                      int field_idx,
+                                      size_t field_offset,
+                                      size_t samples_per_field,
+                                      const double* demod_05_field,
+                                      const int* raw_starts,
+                                      const int* raw_lengths,
+                                      int raw_count,
+                                      const int* valid_starts,
+                                      const int* valid_lengths,
+                                      const int* valid_types,
+                                      int valid_count,
+                                      const double* linelocs,
+                                      int line_count,
+                                      int is_first_field,
+                                      double meanlinelen,
+                                      double first_hsync_loc,
+                                      double first_hsync_line,
+                                      double line0loc) {
+    if (!dump_dir || !dump_dir[0]) return;
+    char mkdir_cmd[1024];
+    std::snprintf(mkdir_cmd, sizeof(mkdir_cmd), "mkdir -p \"%s\"", dump_dir);
+    std::system(mkdir_cmd);
+
+    char prefix[1024];
+    std::snprintf(prefix, sizeof(prefix), "%s/k2_chunk_%zu_field_%d", dump_dir, raw_offset, field_idx);
+    write_f64_file(std::string(prefix) + "_demod_05.f64", demod_05_field, samples_per_field);
+    write_i32_file(std::string(prefix) + "_rawpulse_starts.i32", raw_starts, (size_t)std::max(0, raw_count));
+    write_i32_file(std::string(prefix) + "_rawpulse_lengths.i32", raw_lengths, (size_t)std::max(0, raw_count));
+    write_i32_file(std::string(prefix) + "_valid_starts.i32", valid_starts, (size_t)std::max(0, valid_count));
+    write_i32_file(std::string(prefix) + "_valid_lengths.i32", valid_lengths, (size_t)std::max(0, valid_count));
+    write_i32_file(std::string(prefix) + "_valid_types.i32", valid_types, (size_t)std::max(0, valid_count));
+    write_f64_file(std::string(prefix) + "_linelocs0.f64", linelocs, (size_t)line_count);
+
+    std::ofstream meta(std::string(prefix) + "_config.json");
+    if (meta) {
+        meta << "{\n"
+             << "  \"raw_offset\": " << raw_offset << ",\n"
+             << "  \"field_idx\": " << field_idx << ",\n"
+             << "  \"field_offset\": " << field_offset << ",\n"
+             << "  \"file_offset\": " << (raw_offset + field_offset) << ",\n"
+             << "  \"samples_per_field\": " << samples_per_field << ",\n"
+             << "  \"rawpulse_count\": " << raw_count << ",\n"
+             << "  \"validpulse_count\": " << valid_count << ",\n"
+             << "  \"isFirstField\": " << is_first_field << ",\n"
+             << "  \"meanlinelen\": " << meanlinelen << ",\n"
+             << "  \"first_hsync_loc\": " << first_hsync_loc << ",\n"
+             << "  \"first_hsync_line\": " << first_hsync_line << ",\n"
+             << "  \"line0loc\": " << line0loc << "\n"
+             << "}\n";
+    }
+}
+
+static void maybe_dump_k3_chunk_field(const char* dump_dir,
+                                      size_t raw_offset,
+                                      int field_idx,
+                                      size_t field_offset,
+                                      int line_count,
+                                      const double* coarse_linelocs,
+                                      const double* refined_linelocs) {
+    if (!dump_dir || !dump_dir[0]) return;
+    char mkdir_cmd[1024];
+    std::snprintf(mkdir_cmd, sizeof(mkdir_cmd), "mkdir -p \"%s\"", dump_dir);
+    std::system(mkdir_cmd);
+
+    char prefix[1024];
+    std::snprintf(prefix, sizeof(prefix), "%s/k3_chunk_%zu_field_%d", dump_dir, raw_offset, field_idx);
+    write_f64_file(std::string(prefix) + "_linelocs1.f64", coarse_linelocs, (size_t)line_count);
+    write_f64_file(std::string(prefix) + "_linelocs2.f64", refined_linelocs, (size_t)line_count);
+
+    std::ofstream meta(std::string(prefix) + "_config.json");
+    if (meta) {
+        meta << "{\n"
+             << "  \"raw_offset\": " << raw_offset << ",\n"
+             << "  \"field_idx\": " << field_idx << ",\n"
+             << "  \"field_offset\": " << field_offset << ",\n"
+             << "  \"file_offset\": " << (raw_offset + field_offset) << ",\n"
+             << "  \"line_count\": " << line_count << "\n"
+             << "}\n";
+    }
+}
+
+static void maybe_dump_k4_chunk_field(const char* dump_dir,
+                                      size_t raw_offset,
+                                      int field_idx,
+                                      size_t field_offset,
+                                      size_t field_samples,
+                                      size_t demod_window_samples,
+                                      size_t chroma_window_samples,
+                                      int is_first_field,
+                                      int field_phase_id,
+                                      const uint16_t* luma,
+                                      const uint16_t* chroma,
+                                      const double* demod_window,
+                                      const double* chroma_window,
+                                      const double* linelocs,
+                                      int line_count) {
+    if (!dump_dir || !dump_dir[0]) return;
+    char mkdir_cmd[1024];
+    std::snprintf(mkdir_cmd, sizeof(mkdir_cmd), "mkdir -p \"%s\"", dump_dir);
+    std::system(mkdir_cmd);
+
+    char prefix[1024];
+    std::snprintf(prefix, sizeof(prefix), "%s/k4_chunk_%zu_field_%d", dump_dir, raw_offset, field_idx);
+    std::ofstream(std::string(prefix) + "_luma_u16.u16", std::ios::binary).write(
+        reinterpret_cast<const char*>(luma), (std::streamsize)(field_samples * sizeof(uint16_t)));
+    std::ofstream(std::string(prefix) + "_chroma_u16.u16", std::ios::binary).write(
+        reinterpret_cast<const char*>(chroma), (std::streamsize)(field_samples * sizeof(uint16_t)));
+    write_f64_file(std::string(prefix) + "_demod_window.f64", demod_window, demod_window_samples);
+    write_f64_file(std::string(prefix) + "_demod_burst_window.f64", chroma_window, chroma_window_samples);
+    write_f64_file(std::string(prefix) + "_linelocs_final.f64", linelocs, (size_t)line_count);
+
+    std::ofstream meta(std::string(prefix) + "_config.json");
+    if (meta) {
+        meta << "{\n"
+             << "  \"raw_offset\": " << raw_offset << ",\n"
+             << "  \"field_idx\": " << field_idx << ",\n"
+             << "  \"field_offset\": " << field_offset << ",\n"
+             << "  \"file_offset\": " << (raw_offset + field_offset) << ",\n"
+             << "  \"field_samples\": " << field_samples << ",\n"
+             << "  \"demod_window_samples\": " << demod_window_samples << ",\n"
+             << "  \"demod_burst_window_samples\": " << chroma_window_samples << ",\n"
+             << "  \"is_first_field\": " << is_first_field << ",\n"
+             << "  \"field_phase_id\": " << field_phase_id << ",\n"
+             << "  \"line_count\": " << line_count << "\n"
+             << "}\n";
+    }
+}
+
+static void maybe_dump_k5_chunk_field(const char* dump_dir,
+                                      size_t raw_offset,
+                                      int field_idx,
+                                      size_t field_offset,
+                                      size_t field_samples,
+                                      size_t demod_window_samples,
+                                      const uint16_t* luma,
+                                      const double* demod_window,
+                                      const double* linelocs,
+                                      int line_count) {
+    if (!dump_dir || !dump_dir[0]) return;
+    char mkdir_cmd[1024];
+    std::snprintf(mkdir_cmd, sizeof(mkdir_cmd), "mkdir -p \"%s\"", dump_dir);
+    std::system(mkdir_cmd);
+
+    char prefix[1024];
+    std::snprintf(prefix, sizeof(prefix), "%s/k5_chunk_%zu_field_%d", dump_dir, raw_offset, field_idx);
+    std::ofstream(std::string(prefix) + "_luma_u16.u16", std::ios::binary).write(
+        reinterpret_cast<const char*>(luma), (std::streamsize)(field_samples * sizeof(uint16_t)));
+    write_f64_file(std::string(prefix) + "_demod_window.f64", demod_window, demod_window_samples);
+    write_f64_file(std::string(prefix) + "_linelocs_final.f64", linelocs, (size_t)line_count);
+
+    std::ofstream meta(std::string(prefix) + "_config.json");
+    if (meta) {
+        meta << "{\n"
+             << "  \"raw_offset\": " << raw_offset << ",\n"
+             << "  \"field_idx\": " << field_idx << ",\n"
+             << "  \"field_offset\": " << field_offset << ",\n"
+             << "  \"file_offset\": " << (raw_offset + field_offset) << ",\n"
+             << "  \"field_samples\": " << field_samples << ",\n"
+             << "  \"demod_window_samples\": " << demod_window_samples << ",\n"
+             << "  \"line_count\": " << line_count << "\n"
+             << "}\n";
+    }
 }
 
 static const char* pulse_type_name(int type) {
@@ -451,28 +716,33 @@ static HostLineTimings host_get_line_timings(const int* pulse_lengths,
                                              int pulse_count,
                                              const VideoFormat& fmt) {
     HostLineTimings lt;
-    double tol = fmt.sample_rate * 0.5e-6;
-    double generous_hsync_min = fmt.hsync_width - 3.5 * tol;
-    double generous_hsync_max = fmt.hsync_width + 4.0 * tol;
-    double hsync_sum = 0.0;
-    int hsync_count = 0;
+    double half_us = fmt.sample_rate * 0.5e-6;
+    double broad_hsync_min = fmt.hsync_width - (fmt.sample_rate * 1.75e-6);
+    double broad_hsync_max = fmt.hsync_width + (fmt.sample_rate * 2.0e-6);
+    std::vector<double> hlens;
     int npc = std::max(0, std::min(pulse_count, MAX_PULSES));
     for (int i = 0; i < npc; i++) {
         double len = (double)pulse_lengths[i];
-        if (len >= generous_hsync_min && len <= generous_hsync_max) {
-            hsync_sum += len;
-            hsync_count++;
+        if (len >= broad_hsync_min && len <= broad_hsync_max) hlens.push_back(len);
+    }
+    double hsync_median_est = fmt.hsync_width;
+    if (!hlens.empty()) {
+        size_t mid = hlens.size() / 2;
+        std::nth_element(hlens.begin(), hlens.begin() + mid, hlens.end());
+        hsync_median_est = hlens[mid];
+        if ((hlens.size() & 1U) == 0) {
+            std::nth_element(hlens.begin(), hlens.begin() + mid - 1, hlens.begin() + mid);
+            hsync_median_est = 0.5 * (hsync_median_est + hlens[mid - 1]);
         }
     }
-    double hsync_median_est = hsync_count > 0 ? (hsync_sum / hsync_count) : fmt.hsync_width;
     double hsync_offset = hsync_median_est - fmt.hsync_width;
-    lt.hsync_nominal = fmt.hsync_width + hsync_offset;
-    lt.hsync_min = lt.hsync_nominal - tol;
-    lt.hsync_max = lt.hsync_nominal + tol;
-    lt.eq_min = fmt.eq_pulse_width + hsync_offset - tol;
-    lt.eq_max = fmt.eq_pulse_width + hsync_offset + tol;
+    lt.hsync_nominal = hsync_median_est;
+    lt.hsync_min = lt.hsync_nominal - (fmt.sample_rate * 0.7e-6);
+    lt.hsync_max = lt.hsync_nominal + (fmt.sample_rate * 0.7e-6);
+    lt.eq_min = fmt.eq_pulse_width + hsync_offset - (fmt.sample_rate * 0.9e-6);
+    lt.eq_max = fmt.eq_pulse_width + hsync_offset + (fmt.sample_rate * 0.9e-6);
     lt.vsync_min = (fmt.vsync_width + hsync_offset) * 0.5;
-    lt.vsync_max = fmt.vsync_width + hsync_offset + 2.0 * tol;
+    lt.vsync_max = fmt.vsync_width + hsync_offset + (fmt.sample_rate * 1.0e-6);
     return lt;
 }
 
@@ -503,7 +773,7 @@ static double host_compute_meanlinelen_from_valid_pulses(const std::vector<HostV
     }
 
     std::vector<double> linelens;
-    if (longrun_start >= 1 && longrun_len >= 1) {
+    if (longrun_start >= 0 && longrun_len >= 1) {
         for (int i = longrun_start + 1; i < longrun_start + longrun_len; i++) {
             double linelen = (double)(valid_pulses[(size_t)i].pulse.start - valid_pulses[(size_t)i - 1].pulse.start);
             double ratio = linelen / nominal_line_len;
@@ -632,10 +902,11 @@ static std::vector<HostValidPulse> host_refine_pulses_exactish(const int* pulse_
                    !valid_pulses.empty() &&
                    valid_pulses.back().type == PULSE_HSYNC) {
             std::vector<HostValidPulse> seq = valid_pulses;
+            const int old_valid_size = (int)valid_pulses.size();
             bool done = host_run_vblank_state_machine(raw_pulses, (size_t)(i - 2), lt, fmt.num_eq_pulses, fmt.samples_per_line, seq);
-            if (done && seq.size() > valid_pulses.size()) {
-                valid_pulses = seq;
-                i += (int)(seq.size() - valid_pulses.size()) + 1;
+            if (done && (int)seq.size() > old_valid_size) {
+                valid_pulses = std::move(seq);
+                i += (int)valid_pulses.size() - old_valid_size + 1;
                 i = std::min(i, npc);
             } else {
                 i++;
@@ -1339,8 +1610,25 @@ Pipeline::~Pipeline() {
 static const int FIELD_MARGIN_LINES = 20;
 
 size_t Pipeline::bytes_per_field() const {
+    auto next_pow2_local = [](int n) {
+        int v = 1;
+        while (v < n) v <<= 1;
+        return v;
+    };
+    auto is_7smooth_local = [](int n) {
+        while (n % 2 == 0) n /= 2;
+        while (n % 3 == 0) n /= 3;
+        while (n % 5 == 0) n /= 5;
+        while (n % 7 == 0) n /= 7;
+        return n == 1;
+    };
+    auto next_7smooth_local = [&](int n) {
+        while (!is_7smooth_local(n)) n++;
+        return n;
+    };
+
     size_t spf_padded = fmt.samples_per_field + FIELD_MARGIN_LINES * fmt.samples_per_line;
-    size_t raw = spf_padded * sizeof(double);                  // input (converted, padded)
+    size_t raw = (spf_padded + FM_DEMOD_OVERLAP_SAMPLES) * sizeof(double);  // input + lead context
     size_t demod = spf_padded * sizeof(double);                // demod output (padded)
     size_t demod_05 = spf_padded * sizeof(double);             // sync demod (padded)
     size_t envelope = spf_padded * sizeof(double);             // RF envelope magnitude
@@ -1354,6 +1642,23 @@ size_t Pipeline::bytes_per_field() const {
 
     // K7 (dropout detection) output buffers
     size_t dropouts = MAX_DROPOUTS_PER_FIELD * 3 * sizeof(int) + sizeof(int);  // lines + starts + ends + count
+
+    // K4 chroma scratch. This needs to budget the actual GPU-side temporary
+    // footprint used in chroma_decode(), including the newer field-wide final
+    // filter buffers, or the auto batch estimator becomes too optimistic.
+    int chroma_line_fft = next_pow2_local(fmt.output_line_len);
+    int chroma_line_bins = chroma_line_fft / 2 + 1;
+    int chroma_field_samples = fmt.output_field_lines * fmt.output_line_len;
+    int chroma_field_fft = next_7smooth_local(chroma_field_samples);
+    int chroma_field_bins = chroma_field_fft / 2 + 1;
+    size_t chroma_scratch =
+        2ULL * fmt.output_field_lines * (size_t)chroma_line_fft * sizeof(double) +   // d_het_buf + d_comb_buf
+        fmt.output_field_lines * (size_t)chroma_line_bins * sizeof(cufftDoubleComplex) + // d_fft_buf
+        (size_t)chroma_field_fft * sizeof(double) + // d_field_buf
+        (size_t)chroma_field_bins * sizeof(cufftDoubleComplex) + // d_field_fft
+        2ULL * sizeof(int) +                 // d_field_track + d_field_phase_offset
+        3ULL * sizeof(double) +             // d_phase_i/q/adjust
+        sizeof(double);                     // d_metrics
 
     // cuFFT internal workspace (estimated per field, scales linearly with batch)
     int fft_size = (int)spf_padded;
@@ -1377,14 +1682,30 @@ size_t Pipeline::bytes_per_field() const {
     }
     size_t cufft_workspace = ws_r2c + ws_c2c + ws_c2r;
 
-    return raw + demod + demod_05 + envelope + pulses + linelocs + tbc + chroma + k1_scratch + dropouts + cufft_workspace;
+    size_t estimated =
+        raw + demod + demod_05 + demod + envelope + pulses + linelocs + tbc + chroma +
+        k1_scratch + dropouts + chroma_scratch + cufft_workspace;
+
+    // This estimator is used only for batch sizing. In practice, cuFFT plans,
+    // CUDA allocator behavior, and per-stage transient buffers consume much
+    // more VRAM than the nominal per-field arrays suggest, especially once the
+    // newer whole-field chroma filter path is enabled. Use a conservative
+    // safety factor so the auto batch chooser stays on the safe side.
+    constexpr double kBatchSafetyFactor = 6.0;
+    return (size_t)std::ceil((double)estimated * kBatchSafetyFactor);
 }
 
 bool Pipeline::allocate_buffers() {
+    const char* batch_override_env = env_string("CUVHS_BATCH_SIZE");
+    int batch_override = batch_override_env ? std::max(1, atoi(batch_override_env)) : 0;
+    if (batch_override > 0) {
+        fprintf(stderr, "Batch override via CUVHS_BATCH_SIZE=%d\n", batch_override);
+    }
+    const size_t bytes_per_field_est = bytes_per_field();
     // Try-and-backoff: start aggressive (95% of free VRAM), back off on failure.
     // This maximizes batch size without needing to predict cuFFT workspace overhead.
     for (double fraction = 0.95; fraction >= 0.50; fraction -= 0.05) {
-        batch_size = gpu.max_batch_size(bytes_per_field(), fraction);
+        batch_size = batch_override > 0 ? batch_override : gpu.max_batch_size(bytes_per_field_est, fraction);
 
         // In stream mode, use smaller batches for lower latency
         if (reader.is_stream() && batch_size > 64) batch_size = 64;
@@ -1392,8 +1713,8 @@ bool Pipeline::allocate_buffers() {
 
         fprintf(stderr, "Trying %.0f%% VRAM → batch %d fields (%.1f MB per field, %.1f MB total)%s\n",
                 fraction * 100, batch_size,
-                bytes_per_field() / (1024.0 * 1024.0),
-                batch_size * bytes_per_field() / (1024.0 * 1024.0),
+                bytes_per_field_est / (1024.0 * 1024.0),
+                batch_size * bytes_per_field_est / (1024.0 * 1024.0),
                 reader.is_stream() ? " [stream mode]" : "");
 
         size_t n = batch_size;
@@ -1416,9 +1737,10 @@ bool Pipeline::allocate_buffers() {
 
         // All raw/demod buffers use spf_padded stride so each field's demod data
         // includes continuation samples past the nominal boundary (for TBC resampler).
-        alloc(&d_raw,        n * spf_padded * sizeof(double));
+        alloc(&d_raw,        (n * spf_padded + 2 * FM_DEMOD_OVERLAP_SAMPLES) * sizeof(double));
         alloc(&d_demod,      n * spf_padded * sizeof(double));
         alloc(&d_demod_05,   n * spf_padded * sizeof(double));
+        alloc(&d_demod_burst, n * spf_padded * sizeof(double));
         alloc(&d_envelope,   n * spf_padded * sizeof(double));
         alloc(&d_pulse_starts,  n * MAX_PULSES * sizeof(int));
         alloc(&d_pulse_lengths, n * MAX_PULSES * sizeof(int));
@@ -1445,6 +1767,7 @@ bool Pipeline::allocate_buffers() {
         alloc(&d_k5_bad_geom_line_count, sizeof(int));
         alloc(&d_k5_sync_like_pixel_count, sizeof(int));
         alloc(&d_k5_sync_like_line_counts, n * fmt.output_field_lines * sizeof(int));
+        alloc(&d_k5_level_adjust, n * fmt.output_field_lines * sizeof(double));
         alloc(&d_do_lines,  n * MAX_DROPOUTS_PER_FIELD * sizeof(int));
         alloc(&d_do_starts, n * MAX_DROPOUTS_PER_FIELD * sizeof(int));
         alloc(&d_do_ends,   n * MAX_DROPOUTS_PER_FIELD * sizeof(int));
@@ -1481,6 +1804,7 @@ void Pipeline::free_buffers() {
     safe_free(&d_raw);
     safe_free(&d_demod);
     safe_free(&d_demod_05);
+    safe_free(&d_demod_burst);
     safe_free(&d_envelope);
     safe_free(&d_pulse_starts);
     safe_free(&d_pulse_lengths);
@@ -1503,6 +1827,7 @@ void Pipeline::free_buffers() {
     safe_free(&d_k5_bad_geom_line_count);
     safe_free(&d_k5_sync_like_pixel_count);
     safe_free(&d_k5_sync_like_line_counts);
+    safe_free(&d_k5_level_adjust);
     safe_free(&d_do_lines);
     safe_free(&d_do_starts);
     safe_free(&d_do_ends);
@@ -1526,18 +1851,27 @@ int Pipeline::process_chunk(size_t raw_offset, int num_fields, size_t& next_raw_
     size_t spf = fmt.samples_per_field;
     size_t spf_padded = spf + FIELD_MARGIN_LINES * fmt.samples_per_line;
     size_t tbc_field_size = fmt.output_line_len * fmt.output_field_lines;
+    size_t lead_samples = raw_offset < (size_t)FM_DEMOD_OVERLAP_SAMPLES ? raw_offset : (size_t)FM_DEMOD_OVERLAP_SAMPLES;
+    size_t tail_samples = (size_t)FM_DEMOD_OVERLAP_SAMPLES;
 
     // Read contiguous raw: num_fields * spf_padded (each field needs spf_padded samples)
     size_t total_samples = (size_t)num_fields * spf_padded;
-    auto* h_raw = new double[total_samples];
+    auto* h_raw = new double[lead_samples + total_samples + tail_samples];
 
-    size_t n_read = reader.read_at(h_raw, raw_offset, total_samples);
+    if (lead_samples > 0) {
+        reader.read_at(h_raw, raw_offset - lead_samples, lead_samples);
+    }
+    size_t n_read = reader.read_at(h_raw + lead_samples, raw_offset, total_samples);
     if (n_read < spf) {
         delete[] h_raw;
         return 0;
     }
     if (n_read < total_samples) {
-        memset(h_raw + n_read, 0, (total_samples - n_read) * sizeof(double));
+        memset(h_raw + lead_samples + n_read, 0, (total_samples - n_read) * sizeof(double));
+    }
+    size_t tail_read = reader.read_at(h_raw + lead_samples + total_samples, raw_offset + total_samples, tail_samples);
+    if (tail_read < tail_samples) {
+        memset(h_raw + lead_samples + total_samples + tail_read, 0, (tail_samples - tail_read) * sizeof(double));
     }
 
     int fields_loaded = (int)(n_read / spf);
@@ -1546,26 +1880,49 @@ int Pipeline::process_chunk(size_t raw_offset, int num_fields, size_t& next_raw_
         delete[] h_raw;
         return 0;
     }
+    const int demod_fields_loaded = fields_loaded;
 
     // Upload contiguous raw to GPU
-    cudaMemcpy(d_raw, h_raw, total_samples * sizeof(double), cudaMemcpyHostToDevice);
-    delete[] h_raw;
+    cudaMemcpy(d_raw, h_raw, (lead_samples + total_samples + tail_samples) * sizeof(double), cudaMemcpyHostToDevice);
 
     // ================================================================
     // K1: FM demod → contiguous d_demod, d_demod_05, d_envelope
     // ================================================================
     fm_demod(demod_state,
-             static_cast<double*>(d_raw),
+             lead_samples > 0 ? static_cast<double*>(d_raw) : nullptr,
+             static_cast<double*>(d_raw) + lead_samples,
+             static_cast<double*>(d_raw) + lead_samples + total_samples,
              static_cast<double*>(d_demod),
              static_cast<double*>(d_demod_05),
+             static_cast<double*>(d_demod_burst),
              static_cast<double*>(d_envelope),
+             nullptr,
+             nullptr,
+             nullptr,
+             nullptr,
+             nullptr,
              fields_loaded, spf_padded, fmt);
+
+    if (!env_flag_enabled("CUVHS_DISABLE_K4_SOURCE_REBUILD")) {
+        if (!rebuild_k4_sources_blockwise(h_raw,
+                                          lead_samples + total_samples + tail_samples,
+                                          lead_samples,
+                                          fmt,
+                                          fields_loaded,
+                                          spf_padded,
+                                          static_cast<double*>(d_demod_burst))) {
+            delete[] h_raw;
+            return 0;
+        }
+    }
+
+    delete[] h_raw;
 
     // ================================================================
     // NEW: Global Pulse Discovery (Replaces uniform-stride K2/K3)
     // ================================================================
-    int total_chunk_samples = fields_loaded * spf_padded;
-    int candidate_capacity = fields_loaded * 20;
+    int total_chunk_samples = demod_fields_loaded * spf_padded;
+    int candidate_capacity = demod_fields_loaded * 20;
     
     // Ensure the counter is zeroed out before launching
     cudaMemset(d_candidate_count, 0, sizeof(int));
@@ -1619,10 +1976,37 @@ int Pipeline::process_chunk(size_t raw_offset, int num_fields, size_t& next_raw_
         }
     }
 
+    // The first field found at the very start of a capture often lacks enough
+    // historical context for faithful K2 anchoring. vhs-decode naturally warms
+    // past that startup fragment; skip similarly low-context startup fields here.
+    if (raw_offset == 0 && chunk_field_offsets.size() > 1) {
+        chunk_field_offsets.erase(
+            std::remove_if(
+                chunk_field_offsets.begin(),
+                chunk_field_offsets.end(),
+                [&](size_t off) { return off < fmt.samples_per_field; }),
+            chunk_field_offsets.end());
+    }
+
     fields_loaded = (int)chunk_field_offsets.size();
     if (fields_loaded > num_fields) {
         fields_loaded = num_fields;  // cap to buffer allocation
         chunk_field_offsets.resize(fields_loaded);
+    }
+
+    const size_t demod_total_samples = (size_t)demod_fields_loaded * spf_padded;
+    int complete_fields_loaded = fields_loaded;
+    while (complete_fields_loaded > 1) {
+        size_t tail_field_offset = chunk_field_offsets[(size_t)complete_fields_loaded - 1];
+        if (tail_field_offset + spf_padded <= demod_total_samples) break;
+        complete_fields_loaded--;
+    }
+    bool trimmed_incomplete_tail = complete_fields_loaded < fields_loaded;
+    size_t first_trimmed_field_offset = 0;
+    if (trimmed_incomplete_tail) {
+        first_trimmed_field_offset = chunk_field_offsets[(size_t)complete_fields_loaded];
+        fields_loaded = complete_fields_loaded;
+        chunk_field_offsets.resize((size_t)fields_loaded);
     }
 
     // Compute actual field spacing from detected fields (handles VCR speed drift)
@@ -1644,7 +2028,13 @@ int Pipeline::process_chunk(size_t raw_offset, int num_fields, size_t& next_raw_
     // next GPU batch swallows the entire VSYNC block whole, even if the tape sped up.
     size_t safe_margin = 10 * fmt.samples_per_line;
 
-    if (predicted_next_field > safe_margin) {
+    if (trimmed_incomplete_tail) {
+        if (first_trimmed_field_offset > safe_margin) {
+            next_raw_offset = raw_offset + first_trimmed_field_offset - safe_margin;
+        } else {
+            next_raw_offset = raw_offset + first_trimmed_field_offset;
+        }
+    } else if (predicted_next_field > safe_margin) {
         next_raw_offset = raw_offset + predicted_next_field - safe_margin;
     } else {
         next_raw_offset = raw_offset + predicted_next_field; // Fallback
@@ -1667,6 +2057,13 @@ int Pipeline::process_chunk(size_t raw_offset, int num_fields, size_t& next_raw_
         }
         fprintf(debug_fp, "  actual_spf=%zu (nominal=%zu, diff=%+.0f)\n",
                 actual_spf, spf, (double)actual_spf - (double)spf);
+        if (trimmed_incomplete_tail) {
+            fprintf(debug_fp,
+                    "  [tail-trim] trimmed tail fields lacking full context; first_trimmed_offset=%zu file_offset=%zu remaining=%d\n",
+                    first_trimmed_field_offset,
+                    raw_offset + first_trimmed_field_offset,
+                    fields_loaded);
+        }
         fprintf(debug_fp, "  next_raw_offset=%zu\n", next_raw_offset);
         
         // --- FIXED: Replaced unique_vsyncs with num_candidates ---
@@ -1694,6 +2091,8 @@ int Pipeline::process_chunk(size_t raw_offset, int num_fields, size_t& next_raw_
     bool enable_k2b_host = !getenv("CUVHS_K2B_DISABLE");
     bool log_k2b_host = env_flag_enabled("CUVHS_K2B_LOG");
     if (enable_k2b_host) {
+        const char* dump_k2_dir = env_string("CUVHS_K2_DUMP_DIR");
+        static auto dump_fields = get_dump_fields();
         auto* h_pulse_counts_k2b = new int[fields_loaded];
         auto* h_pulse_starts_k2b = new int[(size_t)fields_loaded * MAX_PULSES];
         auto* h_pulse_lengths_k2b = new int[(size_t)fields_loaded * MAX_PULSES];
@@ -1703,6 +2102,17 @@ int Pipeline::process_chunk(size_t raw_offset, int num_fields, size_t& next_raw_
         auto* h_out_types_k2b = new int[(size_t)fields_loaded * MAX_PULSES];
         auto* h_out_linelocs_k2b = new double[(size_t)fields_loaded * fmt.lines_per_frame];
         auto* h_out_is_first_k2b = new int[fields_loaded];
+        auto* h_meanlinelen_k2b = new double[fields_loaded];
+        auto* h_first_hsync_loc_k2b = new double[fields_loaded];
+        auto* h_first_hsync_line_k2b = new double[fields_loaded];
+        auto* h_line0loc_k2b = new double[fields_loaded];
+        double* h_demod_05_k2b = nullptr;
+        if (dump_k2_dir && !dump_fields.empty()) {
+            h_demod_05_k2b = new double[(size_t)demod_fields_loaded * spf_padded];
+            cudaMemcpy(h_demod_05_k2b, d_demod_05,
+                       (size_t)demod_fields_loaded * spf_padded * sizeof(double),
+                       cudaMemcpyDeviceToHost);
+        }
 
         cudaMemcpy(h_pulse_counts_k2b, d_pulse_count,
                    fields_loaded * sizeof(int), cudaMemcpyDeviceToHost);
@@ -1735,6 +2145,10 @@ int Pipeline::process_chunk(size_t raw_offset, int num_fields, size_t& next_raw_
                 k2b_prev_first_hsync_loc,
                 k2b_prev_first_hsync_diff,
                 75);
+            h_meanlinelen_k2b[field] = meanlinelen;
+            h_first_hsync_loc_k2b[field] = anchor.first_hsync_loc;
+            h_first_hsync_line_k2b[field] = anchor.first_hsync_line;
+            h_line0loc_k2b[field] = anchor.line0loc;
 
             int after = std::min((int)validpulses.size(), MAX_PULSES);
             for (int i = 0; i < after; i++) {
@@ -1795,6 +2209,38 @@ int Pipeline::process_chunk(size_t raw_offset, int num_fields, size_t& next_raw_
                     raw_offset, total_before, total_after, changed_fields, fields_loaded);
         }
 
+        if (h_demod_05_k2b) {
+            for (int df : dump_fields) {
+                int field = df;
+                if (field < 0 || field >= fields_loaded) continue;
+                maybe_dump_k2_chunk_field(
+                    dump_k2_dir,
+                    raw_offset,
+                    field,
+                    chunk_field_offsets[(size_t)field],
+                    spf_padded,
+                    h_demod_05_k2b + (size_t)field * spf_padded,
+                    h_pulse_starts_k2b + (size_t)field * MAX_PULSES,
+                    h_pulse_lengths_k2b + (size_t)field * MAX_PULSES,
+                    h_pulse_counts_k2b[field],
+                    h_out_starts_k2b + (size_t)field * MAX_PULSES,
+                    h_out_lengths_k2b + (size_t)field * MAX_PULSES,
+                    h_out_types_k2b + (size_t)field * MAX_PULSES,
+                    h_out_counts_k2b[field],
+                    h_out_linelocs_k2b + (size_t)field * fmt.lines_per_frame,
+                    fmt.lines_per_frame,
+                    h_out_is_first_k2b[field],
+                    h_meanlinelen_k2b[field],
+                    h_first_hsync_loc_k2b[field],
+                    h_first_hsync_line_k2b[field],
+                    h_line0loc_k2b[field]);
+            }
+        }
+
+        delete[] h_line0loc_k2b;
+        delete[] h_first_hsync_line_k2b;
+        delete[] h_first_hsync_loc_k2b;
+        delete[] h_meanlinelen_k2b;
         delete[] h_out_is_first_k2b;
         delete[] h_out_linelocs_k2b;
         delete[] h_out_types_k2b;
@@ -1804,6 +2250,7 @@ int Pipeline::process_chunk(size_t raw_offset, int num_fields, size_t& next_raw_
         delete[] h_pulse_lengths_k2b;
         delete[] h_pulse_starts_k2b;
         delete[] h_pulse_counts_k2b;
+        delete[] h_demod_05_k2b;
     }
 
     bool debug_k3_host_ref = env_flag_enabled("CUVHS_DEBUG_K3_HOST_REF");
@@ -2012,7 +2459,7 @@ int Pipeline::process_chunk(size_t raw_offset, int num_fields, size_t& next_raw_
     hsync_refine(static_cast<double*>(d_demod_05),
                  static_cast<double*>(d_linelocs),
                  fields_loaded,
-                 fields_loaded * (int)spf_padded,
+                 demod_fields_loaded * (int)spf_padded,
                  fmt);
     if (debug_k4_log) {
         cudaMemset(d_k4_large_delta_count, 0, sizeof(int));
@@ -2025,7 +2472,7 @@ int Pipeline::process_chunk(size_t raw_offset, int num_fields, size_t& next_raw_
                                    static_cast<int*>(d_k4_isolated_jump_count),
                                    static_cast<int*>(d_k4_refined_sync_like_count),
                                    fields_loaded,
-                                   fields_loaded * (int)spf_padded,
+                                   demod_fields_loaded * (int)spf_padded,
                                    fmt);
         int h_k4_large_delta = 0;
         int h_k4_isolated = 0;
@@ -2037,6 +2484,100 @@ int Pipeline::process_chunk(size_t raw_offset, int num_fields, size_t& next_raw_
                 raw_offset, h_k4_large_delta, h_k4_isolated, h_k4_sync_like);
     }
 
+    const char* dump_k3_dir = env_string("CUVHS_K3_DUMP_DIR");
+    static auto dump_fields_k3 = get_dump_fields();
+    if (dump_k3_dir && dump_fields_k3.empty() == false) {
+        auto* h_linelocs1 = new double[(size_t)fields_loaded * fmt.lines_per_frame];
+        auto* h_linelocs2 = new double[(size_t)fields_loaded * fmt.lines_per_frame];
+        cudaMemcpy(h_linelocs1, d_linelocs_coarse,
+                   (size_t)fields_loaded * fmt.lines_per_frame * sizeof(double),
+                   cudaMemcpyDeviceToHost);
+        cudaMemcpy(h_linelocs2, d_linelocs,
+                   (size_t)fields_loaded * fmt.lines_per_frame * sizeof(double),
+                   cudaMemcpyDeviceToHost);
+        for (int df : dump_fields_k3) {
+            int field = df;
+            if (field < 0 || field >= fields_loaded) continue;
+            maybe_dump_k3_chunk_field(
+                dump_k3_dir,
+                raw_offset,
+                field,
+                chunk_field_offsets[(size_t)field],
+                fmt.lines_per_frame,
+                h_linelocs1 + (size_t)field * fmt.lines_per_frame,
+                h_linelocs2 + (size_t)field * fmt.lines_per_frame);
+        }
+        delete[] h_linelocs2;
+        delete[] h_linelocs1;
+    }
+
+    // K5/K6 handoff: burst-based final lineloc adjustment happens inside
+    // chroma_decode(), which updates d_linelocs in place to match
+    // vhs-decode's refine_linelocs_burst() behavior before final outputs.
+    bool debug_compare_demod_postchroma = env_flag_enabled("CUVHS_DEBUG_COMPARE_DEMOD_POSTCHROMA");
+    std::vector<double> h_demod_pre_chroma;
+    if (debug_compare_demod_postchroma) {
+        h_demod_pre_chroma.resize((size_t)demod_fields_loaded * spf_padded);
+        cudaMemcpy(h_demod_pre_chroma.data(), d_demod,
+                   (size_t)demod_fields_loaded * spf_padded * sizeof(double),
+                   cudaMemcpyDeviceToHost);
+    }
+    std::vector<int> field_phase_ids;
+    chroma_decode(static_cast<double*>(d_demod_burst),
+                  static_cast<double*>(d_linelocs),
+                  static_cast<int*>(d_is_first_field),
+                  static_cast<uint16_t*>(d_tbc_chroma),
+                  fields_loaded,
+                  demod_fields_loaded * (int)spf_padded,
+                  fmt,
+                  field_phase_ids,
+                  &chroma_state,
+                  raw_offset);
+    if (debug_compare_demod_postchroma) {
+        std::vector<double> h_demod_post_chroma((size_t)demod_fields_loaded * spf_padded);
+        cudaMemcpy(h_demod_post_chroma.data(), d_demod,
+                   (size_t)demod_fields_loaded * spf_padded * sizeof(double),
+                   cudaMemcpyDeviceToHost);
+        double sum_sq = 0.0;
+        double sum_post_sq = 0.0;
+        double sum_cross = 0.0;
+        double sum_pre = 0.0;
+        double sum_post = 0.0;
+        const size_t n = h_demod_post_chroma.size();
+        for (size_t i = 0; i < n; ++i) {
+            double a = h_demod_pre_chroma[i];
+            double b = h_demod_post_chroma[i];
+            double d = b - a;
+            sum_sq += d * d;
+            sum_post_sq += b * b;
+            sum_cross += a * b;
+            sum_pre += a;
+            sum_post += b;
+        }
+        const double rms = (n > 0) ? std::sqrt(sum_sq / (double)n) : 0.0;
+        const double mean_pre = (n > 0) ? (sum_pre / (double)n) : 0.0;
+        const double mean_post = (n > 0) ? (sum_post / (double)n) : 0.0;
+        double var_pre = 0.0;
+        double var_post = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            double a = h_demod_pre_chroma[i] - mean_pre;
+            double b = h_demod_post_chroma[i] - mean_post;
+            var_pre += a * a;
+            var_post += b * b;
+        }
+        double corr = 0.0;
+        if (var_pre > 0.0 && var_post > 0.0) {
+            double cov = 0.0;
+            for (size_t i = 0; i < n; ++i) {
+                cov += (h_demod_pre_chroma[i] - mean_pre) * (h_demod_post_chroma[i] - mean_post);
+            }
+            corr = cov / std::sqrt(var_pre * var_post);
+        }
+        fprintf(stderr,
+                "  [DEBUG demod postchroma] chunk raw_offset=%zu rms=%.6f corr=%.9f mean_pre=%.6f mean_post=%.6f\n",
+                raw_offset, rms, corr, mean_pre, mean_post);
+    }
+
     // K5: TBC Resample
     bool debug_k5_log = env_flag_enabled("CUVHS_DEBUG_K5_LOG");
     bool debug_k5_mark_oob = env_flag_enabled("CUVHS_DEBUG_K5_MARK_OOB_WHITE");
@@ -2046,6 +2587,19 @@ int Pipeline::process_chunk(size_t raw_offset, int num_fields, size_t& next_raw_
     bool skip_k4 = env_flag_enabled("CUVHS_DEBUG_K4_SKIP");
     const double* k5_linelocs = skip_k4 ? static_cast<double*>(d_linelocs_coarse)
                                         : static_cast<double*>(d_linelocs);
+    auto* h_k5_linelocs = new double[(size_t)fields_loaded * fmt.lines_per_frame];
+    auto* h_k5_is_first = new int[fields_loaded];
+    std::vector<double> h_k5_level_adjust;
+    cudaMemcpy(h_k5_linelocs, k5_linelocs,
+               (size_t)fields_loaded * fmt.lines_per_frame * sizeof(double),
+               cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_k5_is_first, d_is_first_field,
+               (size_t)fields_loaded * sizeof(int),
+               cudaMemcpyDeviceToHost);
+    compute_k5_level_adjust(h_k5_linelocs, h_k5_is_first, fields_loaded, fmt, &h_k5_level_adjust);
+    cudaMemcpy(d_k5_level_adjust, h_k5_level_adjust.data(),
+               (size_t)fields_loaded * fmt.output_field_lines * sizeof(double),
+               cudaMemcpyHostToDevice);
     cudaMemset(d_k5_oob_pixel_count, 0, sizeof(int));
     cudaMemset(d_k5_bad_geom_line_count, 0, sizeof(int));
     cudaMemset(d_k5_sync_like_pixel_count, 0, sizeof(int));
@@ -2053,6 +2607,7 @@ int Pipeline::process_chunk(size_t raw_offset, int num_fields, size_t& next_raw_
                (size_t)fields_loaded * fmt.output_field_lines * sizeof(int));
     tbc_resample(static_cast<double*>(d_demod),
                  k5_linelocs,
+                 static_cast<double*>(d_k5_level_adjust),
                  static_cast<uint16_t*>(d_tbc_luma),
                  static_cast<int*>(d_k5_oob_pixel_count),
                  static_cast<int*>(d_k5_bad_geom_line_count),
@@ -2061,8 +2616,53 @@ int Pipeline::process_chunk(size_t raw_offset, int num_fields, size_t& next_raw_
                  debug_k5_mark_oob,
                  debug_k5_mark_sync,
                  fields_loaded,
-                 fields_loaded * (int)spf_padded,
+                 demod_fields_loaded * (int)spf_padded,
                  fmt);
+    delete[] h_k5_linelocs;
+    delete[] h_k5_is_first;
+
+    const char* dump_k5_dir = env_string("CUVHS_K5_DUMP_DIR");
+    static auto dump_fields_k5 = get_dump_fields();
+    if (dump_k5_dir && !dump_fields_k5.empty()) {
+        auto* h_k5_luma = new uint16_t[(size_t)fields_loaded * tbc_field_size];
+        auto* h_k5_linelocs = new double[(size_t)fields_loaded * fmt.lines_per_frame];
+        auto* h_k5_demod = new double[(size_t)demod_fields_loaded * spf_padded];
+        cudaMemcpy(h_k5_luma, d_tbc_luma,
+                   (size_t)fields_loaded * tbc_field_size * sizeof(uint16_t),
+                   cudaMemcpyDeviceToHost);
+        cudaMemcpy(h_k5_linelocs, k5_linelocs,
+                   (size_t)fields_loaded * fmt.lines_per_frame * sizeof(double),
+                   cudaMemcpyDeviceToHost);
+        cudaMemcpy(h_k5_demod, d_demod,
+                   (size_t)demod_fields_loaded * spf_padded * sizeof(double),
+                   cudaMemcpyDeviceToHost);
+        for (int df : dump_fields_k5) {
+            int field = df;
+            if (field < 0 || field >= fields_loaded) continue;
+            size_t batch_demod_samples = (size_t)demod_fields_loaded * spf_padded;
+            size_t field_demod_offset = chunk_field_offsets[(size_t)field];
+            const double* demod_window = nullptr;
+            size_t demod_window_samples = 0;
+            if (field_demod_offset < batch_demod_samples) {
+                demod_window = h_k5_demod + field_demod_offset;
+                demod_window_samples = std::min((size_t)spf_padded, batch_demod_samples - field_demod_offset);
+            }
+            maybe_dump_k5_chunk_field(
+                dump_k5_dir,
+                raw_offset,
+                field,
+                chunk_field_offsets[(size_t)field],
+                tbc_field_size,
+                demod_window_samples,
+                h_k5_luma + (size_t)field * tbc_field_size,
+                demod_window,
+                h_k5_linelocs + (size_t)field * fmt.lines_per_frame,
+                fmt.lines_per_frame);
+        }
+        delete[] h_k5_demod;
+        delete[] h_k5_linelocs;
+        delete[] h_k5_luma;
+    }
 
     if (debug_k5_log) {
         int h_k5_oob_pixels = 0;
@@ -2506,6 +3106,7 @@ int Pipeline::process_chunk(size_t raw_offset, int num_fields, size_t& next_raw_
         cudaMemset(d_k5_coarse_sync_like_pixel_count, 0, sizeof(int));
         tbc_resample(static_cast<double*>(d_demod),
                      static_cast<double*>(d_linelocs_coarse),
+                     static_cast<double*>(d_k5_level_adjust),
                      static_cast<uint16_t*>(d_tbc_luma),
                      nullptr,
                      static_cast<int*>(d_k5_coarse_bad_geom_line_count),
@@ -2514,7 +3115,7 @@ int Pipeline::process_chunk(size_t raw_offset, int num_fields, size_t& next_raw_
                      false,
                      false,
                      fields_loaded,
-                     fields_loaded * (int)spf_padded,
+                     demod_fields_loaded * (int)spf_padded,
                      fmt);
         int h_k5_coarse_bad_geom = 0;
         int h_k5_coarse_sync_like = 0;
@@ -2523,18 +3124,6 @@ int Pipeline::process_chunk(size_t raw_offset, int num_fields, size_t& next_raw_
         fprintf(stderr, "  [K5 coarse compare] chunk raw_offset=%zu: bad_geom_lines=%d sync_like_pixels=%d\n",
                 raw_offset, h_k5_coarse_bad_geom, h_k5_coarse_sync_like);
     }
-
-    // K6: Chroma Decode
-    std::vector<int> field_phase_ids;
-    chroma_decode(static_cast<double*>(d_raw),
-                  static_cast<double*>(d_linelocs),
-                  static_cast<double*>(d_demod),
-                  static_cast<uint16_t*>(d_tbc_chroma),
-                  fields_loaded,
-                  fields_loaded * (int)spf_padded,
-                  fmt,
-                  field_phase_ids,
-                  &chroma_state);
 
     // K7: Dropout Detection + Concealment
     dropout_detect(static_cast<double*>(d_envelope),
@@ -2550,6 +3139,9 @@ int Pipeline::process_chunk(size_t raw_offset, int num_fields, size_t& next_raw_
     // Download TBC results + dropout metadata and write to disk
     auto* h_luma = new uint16_t[fields_loaded * tbc_field_size];
     auto* h_chroma = new uint16_t[fields_loaded * tbc_field_size];
+    auto* h_linelocs_final = new double[(size_t)fields_loaded * fmt.lines_per_frame];
+    double* h_demod_final = nullptr;
+    double* h_demod_burst_final = nullptr;
 
     size_t do_buf_size = (size_t)fields_loaded * MAX_DROPOUTS_PER_FIELD;
     auto* h_do_lines  = new int[do_buf_size];
@@ -2563,16 +3155,70 @@ int Pipeline::process_chunk(size_t raw_offset, int num_fields, size_t& next_raw_
     cudaMemcpy(h_chroma, d_tbc_chroma,
                fields_loaded * tbc_field_size * sizeof(uint16_t),
                cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_linelocs_final, d_linelocs,
+               (size_t)fields_loaded * fmt.lines_per_frame * sizeof(double),
+               cudaMemcpyDeviceToHost);
     cudaMemcpy(h_do_lines, d_do_lines, do_buf_size * sizeof(int), cudaMemcpyDeviceToHost);
     cudaMemcpy(h_do_starts, d_do_starts, do_buf_size * sizeof(int), cudaMemcpyDeviceToHost);
     cudaMemcpy(h_do_ends, d_do_ends, do_buf_size * sizeof(int), cudaMemcpyDeviceToHost);
     cudaMemcpy(h_do_count, d_do_count, fields_loaded * sizeof(int), cudaMemcpyDeviceToHost);
-
-    // Download field parity
     auto* h_is_first = new int[fields_loaded];
     cudaMemcpy(h_is_first, d_is_first_field, fields_loaded * sizeof(int), cudaMemcpyDeviceToHost);
 
-    static bool last_parity = true;
+    const char* dump_k4_dir = env_string("CUVHS_K4_DUMP_DIR");
+    static auto dump_fields_k4 = get_dump_fields();
+    if (dump_k4_dir && dump_fields_k4.empty() == false) {
+        h_demod_final = new double[(size_t)demod_fields_loaded * spf_padded];
+        h_demod_burst_final = new double[(size_t)demod_fields_loaded * spf_padded];
+        cudaMemcpy(h_demod_final, d_demod,
+                   (size_t)demod_fields_loaded * spf_padded * sizeof(double),
+                   cudaMemcpyDeviceToHost);
+        cudaMemcpy(h_demod_burst_final, d_demod_burst,
+                   (size_t)demod_fields_loaded * spf_padded * sizeof(double),
+                   cudaMemcpyDeviceToHost);
+        char batch_prefix[1024];
+        std::snprintf(batch_prefix, sizeof(batch_prefix), "%s/k4_chunk_%zu", dump_k4_dir, raw_offset);
+        write_f64_file(std::string(batch_prefix) + "_demod_batch.f64",
+                       h_demod_final,
+                       (size_t)demod_fields_loaded * spf_padded);
+        for (int df : dump_fields_k4) {
+            int field = df;
+            if (field < 0 || field >= fields_loaded) continue;
+            size_t demod_window_samples = 0;
+            size_t chroma_window_samples = 0;
+            const double* demod_window = nullptr;
+            const double* chroma_window = nullptr;
+            size_t batch_demod_samples = (size_t)demod_fields_loaded * spf_padded;
+            size_t field_demod_offset = chunk_field_offsets[(size_t)field];
+            if (field_demod_offset < batch_demod_samples) {
+                demod_window = h_demod_final + field_demod_offset;
+                chroma_window = h_demod_burst_final + field_demod_offset;
+                demod_window_samples = std::min((size_t)spf_padded, batch_demod_samples - field_demod_offset);
+                chroma_window_samples = std::min((size_t)spf_padded, batch_demod_samples - field_demod_offset);
+            }
+            int field_phase_id = (field >= 0 && field < (int)field_phase_ids.size())
+                ? field_phase_ids[(size_t)field]
+                : 0;
+            maybe_dump_k4_chunk_field(
+                dump_k4_dir,
+                raw_offset,
+                field,
+                chunk_field_offsets[(size_t)field],
+                tbc_field_size,
+                demod_window_samples,
+                chroma_window_samples,
+                h_is_first[field],
+                field_phase_id,
+                h_luma + (size_t)field * tbc_field_size,
+                h_chroma + (size_t)field * tbc_field_size,
+                demod_window,
+                chroma_window,
+                h_linelocs_final + (size_t)field * fmt.lines_per_frame,
+                fmt.lines_per_frame);
+        }
+    }
+
+    static bool last_parity = false;
 
     for (int i = 0; i < fields_loaded; i++) {
         // Set fileLoc for JSON output (for debugging field position alignment)
@@ -2611,6 +3257,9 @@ int Pipeline::process_chunk(size_t raw_offset, int num_fields, size_t& next_raw_
 
     delete[] h_luma;
     delete[] h_chroma;
+    delete[] h_linelocs_final;
+    delete[] h_demod_final;
+    delete[] h_demod_burst_final;
     delete[] h_do_lines;
     delete[] h_do_starts;
     delete[] h_do_ends;

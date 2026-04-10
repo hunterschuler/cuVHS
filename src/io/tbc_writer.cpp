@@ -95,7 +95,9 @@ bool TBCWriter::write_json() {
         return false;
     }
 
-    const char* sys_name = (fmt.system == VideoSystem::NTSC) ? "NTSC" : "PAL";
+    const char* sys_name = "NTSC";
+    if (fmt.profile == VideoProfile::PAL_625_50_VHS) sys_name = "PAL";
+    if (fmt.profile == VideoProfile::MPAL_525_60_VHS) sys_name = "PAL-M";
 
     // Compute ld-tools compatible metadata values
     double black16b = (0.0 - fmt.vsync_ire) * fmt.output_scale + fmt.output_zero;

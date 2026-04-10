@@ -1,0 +1,38 @@
+name: "Build Windows decode"
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-decode:
+    name: Build vhs-decode (x86_64)
+    runs-on: windows-2022
+    env:
+        SETUPTOOLS_RUST_CARGO_PROFILE: release
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build Python module
+        run: |
+          pip install pyinstaller pyinstaller-versionfile
+          pip install -e ".[hifi_gui_qt6]"
+
+      - name: Build Windows binary
+        run: |
+          python .\scripts\ci\build-windows-decode-bin.py
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: vhs-decode_windows_x86_64
+          path: dist/decode.exe
+          if-no-files-found: error

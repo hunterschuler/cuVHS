@@ -34,8 +34,37 @@ add_executable(cuvhs
     src/pipeline/dropout_detect.cu
 )
 
+add_executable(cuvhs_k1_dump
+    src/tools/k1_dump.cu
+    src/gpu/device.cu
+    src/io/raw_reader.cpp
+    src/format/video_format.cpp
+    src/pipeline/fm_demod.cu
+)
+
+add_executable(cuvhs_k2_dump
+    src/tools/k2_dump.cu
+    src/gpu/device.cu
+    src/io/raw_reader.cpp
+    src/format/video_format.cpp
+    src/pipeline/fm_demod.cu
+    src/pipeline/sync_pulses.cu
+)
+
 target_include_directories(cuvhs PRIVATE src)
 target_link_libraries(cuvhs PRIVATE
+    CUDA::cudart
+    CUDA::cufft
+)
+
+target_include_directories(cuvhs_k1_dump PRIVATE src)
+target_link_libraries(cuvhs_k1_dump PRIVATE
+    CUDA::cudart
+    CUDA::cufft
+)
+
+target_include_directories(cuvhs_k2_dump PRIVATE src)
+target_link_libraries(cuvhs_k2_dump PRIVATE
     CUDA::cudart
     CUDA::cufft
 )

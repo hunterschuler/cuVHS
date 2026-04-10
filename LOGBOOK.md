@@ -2195,3 +2195,586 @@ that had become visible after the streaks were gone.
 
 Field-93 benchmark vectors and ROI notes were recorded separately in this logbook during the
 investigation and can still be used if future regressions reintroduce the streak.
+
+---
+
+## K1 Fidelity Pass: cuVHS vs vhs-decode (2026-04-06)
+
+### Scope
+
+Front-to-back K1 parity work started in the new `cuVHS` demod-first architecture, using the
+same style of granular fidelity measurements that worked well in VHSpp.
+
+Reference tooling was cloned locally into:
+
+- `vhs-decode/`
+
+and K1 dump / compare helpers were added:
+
+- `tools/dump_k1_vhsdecode.py`
+- `src/tools/k1_dump.cu`
+- `tools/measure_array_diff.py`
+
+The primary benchmark probes were:
+
+- native `TAPE_1_1min_33pct.u8` at sample `552960`, blocklen `32768`
+- `40 MHz` `wcbs-tv-1984-11-04_40msps_15m_20m.u8` at sample `140574720`, blocklen `32768`
+
+### Major findings
+
+The early K1 mismatch split into three different classes:
+
+1. Native demod error was dominated by overlap / boundary behavior.
+2. `40 MHz` demod error was dominated by core RF / post-demod filter fidelity.
+3. Envelope error was dominated by a separate scaling + implementation mismatch and was not
+   explained by the demod fixes.
+
+### Fix chain that survived
+
+The following changes materially improved K1 parity and were kept:
+
+- added real lead-in context for overlap-save FM demod instead of clamping negative reads
+- corrected diff-demod unwrap semantics to match `vhs-decode` positive-modulo behavior
+- fixed an illegal memory access in the diff-demod unwrap path when `overlap == 0`
+- made K1 filter setup tape-speed aware
+- restored the missing RF linear ramp in the live RF path
+- fixed `FVideo05` sequencing so delay compensation happens as a time-domain roll instead of
+  being baked into the frequency response incorrectly
+- replaced approximate live post-demod filter construction with exact `freqz`-style
+  de-emphasis generation
+- ported RF peaking into the live `RFVideo` path
+- fixed the envelope gain mismatch with the missing `1/256` scale factor
+- moved the envelope to a block-local `rfft -> RFVideo -> irfft` path
+- fixed a real aliasing bug in the envelope filtfilt kernel where the roll step was reading
+  and writing the same buffer in place, corrupting the source data
+
+### Important dead ends
+
+These were tried and ruled out as primary remaining K1 fixes:
+
+- tail-context extension for the main overlap-save demod path
+- an exact-digital `RFVideo` port by itself, without the rest of the live K1 filter fixes
+- more filter tweaking after `FVideo` / `FVideo05` were already matching the Python dump
+- continuing to blame the envelope on filter generation after the raw block-local replay showed
+  the real issue was in the GPU envelope replay path
+
+### End state
+
+After the final RF-peak and envelope-path fixes, all measured K1 outputs on both benchmark
+samples are under the `1%` RMS error bar relative to the corresponding `vhs-decode` signal RMS.
+
+Final live K1 measurements:
+
+Native `TAPE_1`, sample `552960`
+
+- `demod`: RMS `7705.72`, error `0.2036%`
+- `demod_05`: RMS `6058.28`, error `0.1601%`
+- `raw_env`: RMS `0.002199`, error `0.01765%`
+- `envelope`: RMS `0.001977`, error `0.01763%`
+
+`40 MHz`, sample `140574720`
+
+- `demod`: RMS `19865.17`, error `0.4939%`
+- `demod_05`: RMS `2613.11`, error `0.06498%`
+- `raw_env`: RMS `0.0007041`, error `0.02406%`
+- `envelope`: RMS `0.0006245`, error `0.02392%`
+
+### Remaining note
+
+Native full-block K1 still shows a boundary-dominated difference if measured as a raw block
+against serial `vhs-decode`, but once normalized against signal RMS it is already well under
+the `1%` target. The next fidelity frontier after this point is therefore K2 / sync discovery,
+not more K1 filter chasing.
+
+---
+
+## K2/K3/K4 Fidelity Pass: cuVHS vs vhs-decode (2026-04-06 to 2026-04-07)
+
+### Scope
+
+After K1 reached the sub-`1%` error target, the fidelity pass moved front-to-back through
+K2, K3, and K4 while keeping cuVHS in its real chunked GPU architecture.
+
+The guiding rule in this phase was:
+
+- isolate the first divergence with targeted dumps
+- but always validate the real live pipeline, not an imaginary serial decoder
+
+Additional dump / compare tooling added in this phase:
+
+- `tools/dump_k2_vhsdecode.py`
+- `src/tools/k2_dump.cu`
+- `tools/dump_k3_vhsdecode.py`
+- `tools/dump_k4_vhsdecode.py`
+
+Live pipeline dump support was also added in `pipeline.cu` via:
+
+- `CUVHS_K2_DUMP_DIR`
+- `CUVHS_K3_DUMP_DIR`
+- `CUVHS_K4_DUMP_DIR`
+- `CUVHS_DUMP_FIELDS`
+- `CUVHS_BATCH_SIZE`
+
+### K2 findings and fixes
+
+The first real K2 bug was in raw pulse detection:
+
+- cuVHS was recording every below-threshold run
+- `vhs-decode` length-gates raw pulses during raw finding
+
+That gate was ported into `sync_pulses.cu`.
+
+The next real K2 bugs were in host-side vblank refinement in `pipeline.cu`:
+
+- after a successful vblank expansion, cuVHS only advanced by `1` because the size delta was
+  computed after overwriting the sequence
+- cuVHS merged the local vblank result back into valid pulses incorrectly instead of matching
+  `vhs-decode`'s `append(vblank_pulses[2:])` behavior
+
+Both of those were real fidelity fixes and were kept.
+
+### K2 end state
+
+Once the live chunk K2 anchor outputs were compared directly, the meaningful K2 terms were
+already very close.
+
+Native:
+
+- `isFirstField`: exact match
+- `first_hsync_line`: exact match
+- `meanlinelen`: cuVHS `1819.08`, `vhs-decode` `1819.0803212851406`
+- `meanlinelen` error: `-0.0000177%`
+- normalized `linelocs0` RMS: about `0.0478%` of one line
+
+`40 MHz`:
+
+- `isFirstField`: exact match
+- `first_hsync_line`: exact match
+- `meanlinelen`: cuVHS `2542.51`, `vhs-decode` `2542.503968253968`
+- `meanlinelen` error: `+0.000237%`
+- normalized `linelocs0` RMS: about `0.492%` of one line
+
+The surviving raw/valid-pulse inventory differences after that point looked much more like
+live-window semantics than a downstream K2 geometry failure. In practice, K2 anchor/geometry
+was healthy enough to move on.
+
+### K3 findings and end state
+
+K3 live dump instrumentation then compared the post-anchor line-location refinement path.
+
+Measured active-region errors:
+
+- native coarse `linelocs1`: `0.0204%` of a line
+- native refined `linelocs2`: `0.0306%`
+- `40 MHz` coarse `linelocs1`: `0.0200%`
+- `40 MHz` refined `linelocs2`: `0.0858%`
+
+That made K3 strong enough to stop being the primary suspect. The next fidelity frontier was
+clearly K4.
+
+### K4 major findings
+
+K4 split into two very different stories:
+
+1. final chroma had several real missing / wrong NTSC behaviors
+2. final luma mismatch survived even after those chroma fixes
+
+Initial K4 live comparisons looked like this.
+
+Native:
+
+- luma RMS percent error: about `17.02%`
+- chroma RMS percent error: about `9.84%`
+
+`40 MHz`:
+
+- luma RMS percent error: about `11.66%`
+- chroma RMS percent error: about `8.56%`
+
+### K4 chroma fixes that survived
+
+The following NTSC chroma fixes were real and were kept in `chroma_decode.cu`:
+
+- added NTSC burst deemphasis
+- enabled NTSC comb filtering using the existing comb kernel with `line_hop = 1`
+- fixed dead NTSC phase-offset handling by actually populating `field_phase_offset`
+- switched cycle-start inference to match both phase ID and offset instead of phase ID alone
+- fixed NTSC per-line phase origin so the line rotation advances like `vhs-decode`
+
+These changes materially improved native chroma fidelity and made track detection sane:
+
+- track metrics became well-separated instead of collapsing toward zero
+- carried track/cycle state became stable and meaningful
+
+Native chroma after those fixes:
+
+- chroma RMS percent error improved from about `9.84%` to about `3.61%`
+
+`40 MHz` chroma did not follow the same clean improvement:
+
+- the damaged case remained a problem
+- later runs showed the best aligned `40 MHz` chroma comparison at about
+  RMS `2390.27`, corr `0.6480`, still far from the native result
+
+### K4 luma diagnosis
+
+The crucial luma finding was that the dark / biased mismatch is already present in Hz-domain
+resampled luma before final `uint16` packing.
+
+That ruled out simple blame on the final `Hz -> IRE -> uint16` constants.
+
+To localize it further:
+
+- cuVHS was taught to dump live `linelocs_final.f64` in K4
+- `tools/dump_k4_vhsdecode.py` was extended to dump `python_linelocs_final.f64`
+
+That showed the next important fact:
+
+- cuVHS is still carrying a full `525`-line final lineloc grid into K4
+- `vhs-decode` final `f.linelocs` for the field output path is a trimmed `273`-line field grid
+
+A quick A/B that simply added `active_line_start` inside `tbc_resample.cu` did not materially
+change the aligned `40 MHz` K4 result and was reverted. So the K4 luma problem is not a trivial
+vertical-origin off-by-N bug.
+
+### Current K4 conclusion
+
+The real K4 luma divergence is now understood as an algorithmic mismatch in the resampler.
+
+`vhs-decode` K4 luma path:
+
+- builds a spline over final linelocs via `computewow_scaled()`
+- computes `interpolated_pixel_locs` and `wowfactors`
+- applies the reference lineoffset / outline-offset behavior
+- rescales through `scale_field(...)`
+
+cuVHS K4 luma path currently:
+
+- linearly maps each output row between adjacent line starts
+- then does Catmull-Rom interpolation on the demod samples
+
+That explains why:
+
+- K1 can be good
+- K2 can be good
+- K3 can be good
+- but final luma can still carry a geometry-shaped dark bias
+
+### Performance note
+
+All K2/K3/K4 forensic runs in this phase used heavy dump instrumentation and small debug
+batches (`CUVHS_BATCH_SIZE=8`), which drove observed probe runs down to roughly
+`1.4-1.5 FPS`. Those numbers are instrumentation tax and should not be read as production
+throughput regressions.
+
+### Current next step
+
+The next fidelity job is now explicit:
+
+- port the reference-style K4 luma resampling model from `vhs-decode`
+- meaning the `computewow_scaled()` / `scale_field(...)` behavior
+- rather than continuing to guess with isolated coordinate tweaks inside `tbc_resample.cu`
+
+## 2026-04-07: K5 luma breakthrough, geometry-vs-resampler split
+
+Worked from the new live K4/K5 dump harnesses on the aligned `40 MHz` field-35-region probe and
+finally got a trustworthy answer about the remaining K4 luma gap.
+
+### Cleanups and instrumentation
+
+- removed the abandoned burst-sync experiment from `src/pipeline/chroma_decode.cu`
+- added a true pre-dropout K5 dump path in `src/pipeline/pipeline.cu`
+- K5 dumps now include:
+  - pre-dropout luma
+  - final linelocs used by K5
+  - the exact demod window K5 samples from
+
+This mattered because the old “K4 dump” luma was captured after later pipeline stages and was not
+clean enough for a pure K5 replay test.
+
+### Geometry-vs-resampler result
+
+Using the new K5 dump path, an offline Python replay of the cuVHS K5 math reproduced the dumped
+pre-dropout luma bit-for-bit on the aligned `40 MHz` field. That confirmed the K5 replay harness
+was valid.
+
+Then I swapped only the geometry:
+
+- same cuVHS demod window
+- same cuVHS K5 resampler math
+- Python final linelocs substituted in
+
+That did **not** improve the field. It got materially worse.
+
+So the main remaining K4 luma problem is **not** “still bad geometry feeding K5.”
+The main problem was the K5 resampler / level-adjust model itself.
+
+### The winning K5 luma fix
+
+Offline testing showed that the reference-style linear `scale_field(...)` behavior on the current
+cuVHS linelocs was the right direction:
+
+- keep the current cuVHS geometry
+- use the one-line `outline_offset` behavior that corresponds to `lineoffset = 0`
+- apply wow-derived per-line level adjustment with the same median/MAD clipping idea as
+  `vhs-decode`
+
+Ported that into CUDA:
+
+- `src/pipeline/tbc_resample.cu`
+- `src/pipeline/tbc_resample.h`
+- `src/pipeline/pipeline.cu`
+
+Important note:
+
+- earlier attempts using `lineoffset = 2/3` were wrong and regressed fidelity
+- the correct improvement came from the `lineoffset = 0` / one-line-offset form used in the
+  linear `scale_field(...)` path on this field geometry
+
+### Measured `40 MHz` luma improvement
+
+Aligned field comparison against `vhs-decode` on the live `40 MHz` probe:
+
+Before the K5 luma fix:
+
+- luma RMS `3743.87`
+- luma RMS percent error `32.92%`
+- luma corr `0.9462`
+
+After the K5 luma fix:
+
+- luma RMS `1063.21`
+- luma RMS percent error `9.35%`
+- luma corr `0.9957`
+
+So K5 luma is now dramatically closer to `vhs-decode` on the damaged aligned field.
+
+### Performance note
+
+The heavily dumped debug runs used to validate this remained around `2.0 FPS`, which is basically
+flat versus the earlier K5 debug probes. So this K5 luma fidelity fix did not introduce an obvious
+throughput cliff in debug mode.
+
+### New K4 priority
+
+With luma now much better, chroma is clearly the bigger remaining K4 problem on the aligned
+`40 MHz` field.
+
+Current aligned chroma comparison on the current branch state:
+
+- chroma RMS `2390.27`
+- chroma RMS percent error `91.40%`
+- chroma corr `0.6480`
+
+So the next K4 fidelity frontier is now:
+
+- `src/pipeline/chroma_decode.cu`
+- especially the final chroma amplitude / phase path on damaged NTSC material
+
+## 2026-04-07: K4 chroma ACC and NTSC phase-comp breakthrough
+
+Stayed on the aligned `40 MHz` live field and attacked K4 chroma the same way K5 luma was solved:
+first isolate the final stage, then port only the faithful behavior that actually helps.
+
+### New dump plumbing
+
+Added a true pre-ACC chroma dump in `src/pipeline/chroma_decode.cu`.
+
+The live K4 dump now writes:
+
+- `k4_chunk_*_field_*_chroma_preacc.f64`
+
+This is the post-heterodyne / post-final-filter / post-comb chroma signal immediately before the
+final ACC + `uint16` output stage.
+
+That made it possible to replay the final chroma output law offline against the exact live cuVHS
+signal instead of guessing from final `u16`.
+
+### First real chroma fix: ACC / output semantics
+
+The first big surviving chroma fix was in the final ACC/output stage.
+
+cuVHS was:
+
+- normalizing and outputting every line, including the first 16
+- using `+32768`
+- rounding by `+0.5`
+- using `0.0` gain when burst RMS vanished
+
+`vhs-decode` effectively does this instead:
+
+- leave the first 16 lines at neutral chroma
+- ACC only from line 16 onward
+- `+32767`
+- direct cast to `uint16`
+- unity gain fallback if burst RMS is zero
+
+Ported that behavior into `k_chroma_acc_output`.
+
+Aligned `40 MHz` chroma immediately improved from:
+
+- RMS `2390.27`
+- RMS percent error `91.40%`
+- corr `0.6480`
+
+to:
+
+- RMS `1392.51`
+- RMS percent error `53.24%`
+- corr `0.8472`
+
+and the pathological clipping disappeared.
+
+### Next real chroma fix: NTSC field phase compensation
+
+Offline replay on the dumped `chroma_preacc.f64` then showed that one more big fidelity bug was
+still present: cuVHS had no equivalent of `vhs-decode`'s NTSC field-wide chroma phase compensation.
+
+Using a Hilbert-domain offline replay on the exact dumped cuVHS `chroma_preacc` field:
+
+- best field-wide phase rotation was around `-26.5°`
+- centered chroma corr improved from about `0.847` to about `0.948`
+
+So a true NTSC phase-comp step was clearly warranted.
+
+The first live attempt was wrong:
+
+- it targeted the wrong phase frame
+- and worse, it was inserted inside the chunk retry loop
+- that polluted the burst-cancellation metric and caused bogus track flips
+
+That version was discarded.
+
+The correct live port was:
+
+- keep chunk track detection / retry unchanged
+- finish heterodyne, final filter, deemphasis, and comb first
+- measure per-field burst phase on the resulting pre-ACC chroma
+- run a fresh FFT on that pre-ACC chroma
+- apply a per-field complex spectrum rotation toward the empirically correct NTSC target phase
+- inverse FFT back to time domain
+- compensate the extra FFT-pair scale factor by dividing by `fft_size`
+- then run the fixed ACC/output stage
+
+This logic now lives in `src/pipeline/chroma_decode.cu`.
+
+### Current aligned `40 MHz` chroma result
+
+With both the ACC fix and the post-retry NTSC phase compensation in place, the aligned live
+`40 MHz` field now measures:
+
+- RMS `858.93`
+- RMS percent error `32.84%`
+- corr `0.9467`
+
+That is still not “done,” but it is a major improvement from the earlier:
+
+- RMS `2390.27`
+- RMS percent error `91.40%`
+- corr `0.6480`
+
+### Throughput sanity
+
+The heavy debug probe with `CUVHS_BATCH_SIZE=8` and K4 dump hooks remained about `2.0 FPS`, so
+the chroma fidelity changes did not produce an obvious debug-mode cliff.
+
+A clean non-dump native sanity run on `TAPE_1_parallel_short.u8` with `CUVHS_BATCH_SIZE=16`
+completed in:
+
+- `41` fields in `4.0s`
+- about `5.2 FPS`
+
+So the chroma fixes do not appear to have catastrophically tanked normal throughput.
+
+### Current next step
+
+K4 chroma is now much healthier, but there is still meaningful gap on the aligned damaged field.
+The next likely work is to compare cuVHS `chroma_preacc` directly against a dumped
+`vhs-decode` pre-ACC chroma waveform and isolate whether the remaining error is mostly:
+
+- residual NTSC phase-target convention drift
+- or earlier upconvert / final-filter shape differences in `src/pipeline/chroma_decode.cu`
+
+## 2026-04-07: Burst-sync lineloc handoff port
+
+Ported the missing `vhs-decode` burst-sync lineloc handoff into the live cuVHS
+pipeline.
+
+Reference behavior in `vhs-decode`:
+
+- `FieldNTSCShared._sync_to_burst()` / `refine_linelocs_burst()` in
+  `vhsdecode/field.py`
+- adjusts final line starts using per-line burst phase relative to the field
+  burst average
+- this happens after K3-style geometry refinement and before final luma/chroma
+  output
+
+cuVHS had been missing that entirely. `d_linelocs` from HSYNC refine went
+straight into final output.
+
+### What changed
+
+In `src/pipeline/chroma_decode.cu`:
+
+- added host-side burst phase sequence measurement over the live upconverted
+  field waveform
+- added a direct port of the burst-sync line adjustment:
+  `phase_delta -> 4*fsc line adjust -> scaled by current line length`
+- gated the correction with the same trust model used by `vhs-decode`:
+  interior-line averaging only, coherence threshold before applying
+
+In `src/pipeline/pipeline.cu`:
+
+- moved `chroma_decode(...)` ahead of K5 luma so the burst-derived correction can
+  update `d_linelocs` before both final outputs consume it
+- K5 luma now runs from the corrected `d_linelocs`
+
+### Measured result
+
+Native short probe (`TAPE_1_parallel_short.u8`, field 0 live compare):
+
+- previous cuVHS native luma vs `vhs-decode`: RMS `5122.54`, `19.01%`, corr `0.8594`
+- after burst-sync handoff port: RMS `1329.53`, `4.93%`, corr `0.9910`
+
+Native final linelocs vs `vhs-decode` final linelocs, after removing the constant
+coordinate-origin offset:
+
+- centered RMS `12.06`
+- about `0.663%` of one line
+
+Aligned `40 MHz` live probe:
+
+- luma remained at the current good state:
+  RMS `1063.21`, `3.31%`, corr `0.9957`
+- chroma remained at the current good state:
+  RMS `840.00`, `2.56%`, corr `0.9495`
+
+So the burst-sync handoff is now present in the real cuVHS pipeline and it
+materially improves the native luma side. It does **not** resolve the remaining
+K4 chroma mismatch by itself.
+
+### Throughput sanity
+
+The dump-heavy native probe still runs around `2.5 FPS` with:
+
+- `CUVHS_BATCH_SIZE=16`
+- `CUVHS_K4_DUMP_DIR=...`
+- `CUVHS_DUMP_FIELDS=0`
+
+That is instrumentation tax.
+
+A clean non-dump native sanity run on `TAPE_1_parallel_short.u8` completed at:
+
+- `42` fields in `1.8s`
+- about `11.5 FPS`
+
+So the handoff fix does not appear to have introduced a meaningful throughput
+cliff in normal decode mode.
+
+### Current conclusion
+
+K3-to-K4 handoff is now materially more faithful than before.
+
+What remains in K4 is not the missing burst-sync geometry handoff anymore. The
+main remaining gap is still in final chroma waveform formation inside
+`src/pipeline/chroma_decode.cu`.

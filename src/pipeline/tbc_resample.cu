@@ -19,6 +19,7 @@
 __global__ void k_tbc_resample(
     const double* __restrict__ demod,       // [total_batch_samples] FM demod output (Hz)
     const double* __restrict__ linelocs,    // [num_fields x lines_per_frame]
+    const double* __restrict__ level_adjust,// [num_fields x output_field_lines]
     uint16_t* __restrict__ tbc_luma,        // [num_fields x output_field_lines x output_line_len]
     int* __restrict__ oob_pixel_count,      // optional debug counter
     int* __restrict__ bad_geom_line_count,  // optional debug counter
@@ -30,9 +31,6 @@ __global__ void k_tbc_resample(
     int lines_per_frame,
     int output_field_lines,
     int output_line_len,
-    int active_line_start,          // first active video line in linelocs
-    int active_video_start,         // first active output sample (exclude porch/sync)
-    int active_video_end,           // one past last active output sample
     int total_demod_samples,        // total samples in d_demod buffer (for bounds check)
     double samples_per_line_nominal,
     double ire0,
@@ -54,11 +52,7 @@ __global__ void k_tbc_resample(
     int out_line = rem / output_line_len;
     int out_col = rem % output_line_len;
 
-    // Map output row directly to the field's line index. The lineloc grid
-    // already represents the full field; adding active_line_start here shifts
-    // the raster down and wraps the top-of-field non-picture region to the
-    // bottom of the 263-line output.
-    int ll_line = out_line;
+    int ll_line = out_line + 1;
     int ll_next = ll_line + 1;
 
     // Bounds check on linelocs
@@ -106,11 +100,14 @@ __global__ void k_tbc_resample(
     double b = 2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3;
     double c = 3.0 * (p1 - p2) + p3 - p0;
     double hz_value = p1 + 0.5 * x * (a + x * (b + x * c));
+    if (level_adjust) {
+        hz_value *= level_adjust[field * output_field_lines + out_line];
+    }
 
     // Convert Hz → IRE (shifted so vsync = 0)
     double ire = (hz_value - ire0) / hz_ire - vsync_ire;
 
-    bool in_active_picture = (out_col >= active_video_start && out_col < active_video_end);
+    bool in_active_picture = (out_col >= 134 && out_col < 894);
     bool sync_like = in_active_picture && (hz_value <= pulse_threshold_hz);
     if (sync_like) {
         if (sync_like_pixel_count) atomicAdd(sync_like_pixel_count, 1);
@@ -139,6 +136,7 @@ __global__ void k_tbc_resample(
 
 void tbc_resample(const double* d_demod,
                   const double* d_linelocs,
+                  const double* d_level_adjust,
                   uint16_t* d_tbc_luma,
                   int* d_oob_pixel_count,
                   int* d_bad_geom_line_count,
@@ -152,15 +150,13 @@ void tbc_resample(const double* d_demod,
 {
     int pixels_per_field = fmt.output_field_lines * fmt.output_line_len;
     int total_pixels = num_fields * pixels_per_field;
-    int active_video_start = (fmt.system == VideoSystem::NTSC) ? 134 : 185;
-    int active_video_end = (fmt.system == VideoSystem::NTSC) ? 894 : 1107;
-
     int threads = 256;
     int blocks = (total_pixels + threads - 1) / threads;
 
     k_tbc_resample<<<blocks, threads>>>(
         d_demod,
         d_linelocs,
+        d_level_adjust,
         d_tbc_luma,
         d_oob_pixel_count,
         d_bad_geom_line_count,
@@ -172,9 +168,6 @@ void tbc_resample(const double* d_demod,
         fmt.lines_per_frame,
         fmt.output_field_lines,
         fmt.output_line_len,
-        fmt.active_line_start,
-        active_video_start,
-        active_video_end,
         total_demod_samples,
         fmt.samples_per_line,
         fmt.ire0,
